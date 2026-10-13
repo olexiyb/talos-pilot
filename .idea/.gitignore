@@ -1,0 +1,20 @@
+# Default ignored files
+/shelf/
+/workspace.xml
+# Editor-based HTTP Client requests
+/httpRequests/
+# Ignored default folder with query files
+/queries/
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+# Per-user / machine-specific state
+/tasks.xml
+/usage.statistics.xml
+/dictionaries/
+/aws.xml
+/sonarlint/
+/copilot*
+/*.local.xml
+# Go plugin default, not relevant to this Rust project
+/go.imports.xml
