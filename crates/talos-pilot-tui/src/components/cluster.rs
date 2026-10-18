@@ -811,6 +811,8 @@ pub struct ClusterComponent {
     network_info: HashMap<(String, String), (std::time::Instant, Option<NodeNetworkInfo>)>,
     /// In-flight network summary fetch for the selected node(s) (see `poll_network_info`)
     network_fetch: Option<NetworkFetch>,
+    /// Clock offset per (context, node name), fetched with the network summary
+    clock_info: HashMap<(String, String), NodeClock>,
     /// In-flight stats fetch for the selected node (see `refresh_selected_node`)
     node_stats_fetch: Option<tokio::task::JoinHandle<NodeStatsFetch>>,
     /// Screen regions from the last draw, for mapping mouse clicks
@@ -858,12 +860,77 @@ type NetworkFetch = tokio::task::JoinHandle<
     Vec<(
         (String, String),
         Result<NodeNetworkInfo, talos_rs::TalosError>,
+        Option<NodeClock>,
     )>,
 >;
 
-/// How often the selected node's network summary is re-fetched. It changes
-/// rarely and costs four talosctl invocations, so this is much slower than
-/// the stats auto-refresh.
+/// A node's clock against its NTP server, from the Talos Time API
+#[derive(Debug, Clone, PartialEq)]
+struct NodeClock {
+    /// Node time minus the NTP server's (seconds, positive = node ahead)
+    offset_secs: f64,
+    server: String,
+}
+
+/// Upper bound for one node's Time API call
+const CLOCK_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Clock offsets that are worth a look / a problem (seconds): etcd leases
+/// and certificate checks start failing well before a few seconds
+const CLOCK_WARN_SECS: f64 = 0.1;
+const CLOCK_ERROR_SECS: f64 = 1.0;
+
+/// Ask a node for its time and its NTP server's. `None` unless both are
+/// known (the client library reads a missing time as a zero offset).
+async fn fetch_node_clock(client: TalosClient) -> Option<NodeClock> {
+    let times = tokio::time::timeout(CLOCK_QUERY_TIMEOUT, client.time())
+        .await
+        .ok()?
+        .ok()?;
+    let time = times.into_iter().next()?;
+    let (local, remote) = (time.local_time?, time.remote_time?);
+    let offset_secs = match local.duration_since(remote) {
+        Ok(ahead) => ahead.as_secs_f64(),
+        Err(behind) => -behind.duration().as_secs_f64(),
+    };
+    Some(NodeClock {
+        offset_secs,
+        server: time.server,
+    })
+}
+
+/// A clock offset as `+12ms` / `-1.5s`, colored by size
+fn clock_span(clock: &NodeClock) -> Span<'static> {
+    let o = clock.offset_secs;
+    let text = if o.abs() < 1.0 {
+        format!("{:+.0}ms", o * 1000.0)
+    } else {
+        format!("{o:+.1}s")
+    };
+    let color = if o.abs() >= CLOCK_ERROR_SECS {
+        Color::Red
+    } else if o.abs() >= CLOCK_WARN_SECS {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    Span::styled(text, Style::default().fg(color))
+}
+
+/// A node's tailnet IPv4 (or first) address without its prefix
+fn tailnet_ip(ts: &talos_rs::TailscaleLink) -> Option<&str> {
+    let addr = ts
+        .addresses
+        .iter()
+        .find(|a| !a.contains(':'))
+        .or_else(|| ts.addresses.first())?;
+    Some(addr.split('/').next().unwrap_or(addr))
+}
+
+/// How often the selected node's network summary (with Tailscale, KubeSpan
+/// peers and clock offset) is re-fetched. It changes rarely and costs seven
+/// talosctl invocations per node, so this is much slower than the stats
+/// auto-refresh.
 const NETWORK_INFO_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Default for ClusterComponent {
@@ -1159,6 +1226,7 @@ impl ClusterComponent {
             cluster_refreshed_at: Vec::new(),
             network_info: HashMap::new(),
             network_fetch: None,
+            clock_info: HashMap::new(),
             node_stats_fetch: None,
             hits: std::cell::RefCell::new(HitMap::default()),
         }
@@ -1631,7 +1699,11 @@ impl ClusterComponent {
                 Some(Ok(results)) => results,
                 _ => Vec::new(),
             };
-            for (key, result) in results {
+            for (key, result, clock) in results {
+                // A failed clock read keeps the last known offset
+                if let Some(clock) = clock {
+                    self.clock_info.insert(key.clone(), clock);
+                }
                 let previous = self.network_info.remove(&key).and_then(|(_, info)| info);
                 let info = match result {
                     Ok(info) => Some(info),
@@ -1671,13 +1743,23 @@ impl ClusterComponent {
 
         let context = cluster.name.clone();
         let config_path = self.config_path.clone();
+        let client = cluster.client.clone();
         self.network_fetch = Some(tokio::spawn(async move {
             let fetches = targets.into_iter().map(|(key, ip)| {
                 let context = &context;
                 let config_path = config_path.as_deref();
+                let node_client = client.as_ref().map(|c| c.with_node(&ip));
                 async move {
-                    let result = talos_rs::get_node_network_info(context, &ip, config_path).await;
-                    (key, result)
+                    let (result, clock) = tokio::join!(
+                        talos_rs::get_node_network_info(context, &ip, config_path),
+                        async {
+                            match node_client {
+                                Some(c) => fetch_node_clock(c).await,
+                                None => None,
+                            }
+                        }
+                    );
+                    (key, result, clock)
                 }
             });
             futures::future::join_all(fetches).await
@@ -1698,6 +1780,13 @@ impl ClusterComponent {
     }
 
     /// Network summary for a node in the active cluster, if fetched
+    /// Clock offset of a node in a cluster, if fetched
+    fn get_node_clock_for(&self, cluster_idx: usize, node_name: &str) -> Option<&NodeClock> {
+        let cluster = self.clusters.get(cluster_idx)?;
+        self.clock_info
+            .get(&(cluster.name.clone(), node_name.to_string()))
+    }
+
     fn get_node_network_info(&self, node_name: &str) -> Option<&NodeNetworkInfo> {
         self.get_node_network_info_for(self.active_cluster, node_name)
     }
@@ -3124,6 +3213,10 @@ impl ClusterComponent {
         let has_zfs = nodes
             .iter()
             .any(|n| !self.get_node_zfs_pools_for(cluster_idx, n).is_empty());
+        let has_tailscale = nodes.iter().any(|n| {
+            self.get_node_network_info_for(cluster_idx, n)
+                .is_some_and(|net| net.tailscale.is_some())
+        });
 
         // A version differing from the group's most common one is highlighted,
         // which makes a partly rolled-out upgrade stand out.
@@ -3266,6 +3359,24 @@ impl ClusterComponent {
                     Some(false) => Cell::from(Span::styled("✗", Style::default().fg(Color::Red))),
                     None => pending(),
                 };
+                let tailscale = match net.map(|n| n.tailscale.as_ref()) {
+                    None => pending(),
+                    Some(None) => Cell::from(Span::styled("-", dim)),
+                    Some(Some(ts)) => match (ts.up, tailnet_ip(ts)) {
+                        (true, Some(ip)) => Cell::from(ip.to_string()),
+                        (true, None) => {
+                            Cell::from(Span::styled("no IP", Style::default().fg(Color::Red)))
+                        }
+                        (false, _) => {
+                            Cell::from(Span::styled("down", Style::default().fg(Color::Red)))
+                        }
+                    },
+                };
+                let clock = match self.get_node_clock_for(cluster_idx, node) {
+                    Some(clock) => Cell::from(clock_span(clock)),
+                    None if net.is_some() => Cell::from(Span::styled("?", dim)),
+                    None => pending(),
+                };
 
                 let svc = match self.get_node_services_for(cluster_idx, node) {
                     Some(services) => {
@@ -3307,7 +3418,11 @@ impl ClusterComponent {
                 if wide {
                     cells.push(cores);
                 }
-                cells.extend([uptime, conn, svc, gw]);
+                cells.extend([uptime, conn, svc]);
+                if has_tailscale {
+                    cells.push(tailscale);
+                }
+                cells.extend([clock, gw]);
                 Row::new(cells)
             })
             .collect();
@@ -3353,13 +3468,18 @@ impl ClusterComponent {
             header.push("Cores");
             widths.push(Constraint::Length(5));
         }
-        header.extend(["Uptime", "Conn", "Svc", "GW"]);
+        header.extend(["Uptime", "Conn", "Svc"]);
         widths.extend([
             Constraint::Length(8),
             Constraint::Length(4),
             Constraint::Length(5),
-            Constraint::Fill(1),
         ]);
+        if has_tailscale {
+            header.push("Tailscale");
+            widths.push(Constraint::Length(15));
+        }
+        header.extend(["Clock", "GW"]);
+        widths.extend([Constraint::Length(7), Constraint::Fill(1)]);
 
         let header = Row::new(header).style(Style::default().fg(Color::Gray).bold());
         let table = Table::new(rows, widths).header(header).column_spacing(2);
@@ -3370,9 +3490,26 @@ impl ClusterComponent {
             Some(Err(_)) => 2,
             None => 0,
         };
-        let [table_area, linstor_area, services_area, hint_area] = Layout::vertical([
+        let has_kubespan = nodes.iter().any(|n| {
+            self.get_node_network_info_for(cluster_idx, n)
+                .and_then(|net| net.kubespan_peers.as_ref())
+                .is_some_and(|peers| !peers.is_empty())
+        });
+        let kubespan_height = if has_kubespan && nodes.len() > 1 {
+            nodes.len() as u16 + 2 // header + rows + spacer
+        } else {
+            0
+        };
+        let [
+            table_area,
+            linstor_area,
+            kubespan_area,
+            services_area,
+            hint_area,
+        ] = Layout::vertical([
             Constraint::Length(nodes.len() as u16 + 2), // header + rows + spacer
             Constraint::Length(linstor_height),
+            Constraint::Length(kubespan_height),
             Constraint::Min(2),
             Constraint::Length(1),
         ])
@@ -3380,6 +3517,9 @@ impl ClusterComponent {
         frame.render_widget(table, table_area);
         if let Some(linstor) = linstor {
             draw_linstor_table(frame, linstor_area, linstor);
+        }
+        if kubespan_height > 0 {
+            self.draw_kubespan_matrix(frame, kubespan_area, cluster_idx, &nodes);
         }
         self.draw_services_matrix(frame, services_area, cluster_idx, &nodes);
         frame.render_widget(
@@ -3423,6 +3563,87 @@ impl ClusterComponent {
                 (whole_cluster || !rows.is_empty()).then_some(Ok(rows))
             }
         }
+    }
+
+    /// KubeSpan peer state between the group's nodes: one row per node (as
+    /// it sees its peers), one column per peer. Node-to-node traffic such as
+    /// DRBD replication and etcd runs over these links.
+    fn draw_kubespan_matrix(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        cluster_idx: usize,
+        nodes: &[String],
+    ) {
+        let dim = Style::default().dim();
+        let mut down = 0;
+        let rows: Vec<Row> = nodes
+            .iter()
+            .map(|node| {
+                let peers = self
+                    .get_node_network_info_for(cluster_idx, node)
+                    .and_then(|net| net.kubespan_peers.as_ref());
+                let mut cells = vec![Cell::from(node.clone())];
+                cells.extend(nodes.iter().map(|peer| {
+                    let (symbol, style) = if peer == node {
+                        (" ", dim)
+                    } else {
+                        match peers {
+                            // Not read yet, or unreadable
+                            None => ("…", dim),
+                            Some(peers) => {
+                                match peers.iter().find(|p| p.label.eq_ignore_ascii_case(peer)) {
+                                    // Not a KubeSpan peer of this node
+                                    None => ("·", dim),
+                                    Some(p) => match p.state.as_str() {
+                                        "up" => ("●", Style::default().fg(Color::Green)),
+                                        "down" => {
+                                            down += 1;
+                                            ("✗", Style::default().fg(Color::Red))
+                                        }
+                                        _ => ("?", Style::default().fg(Color::Yellow)),
+                                    },
+                                }
+                            }
+                        }
+                    };
+                    Cell::from(Span::styled(symbol, style))
+                }));
+                Row::new(cells)
+            })
+            .collect();
+
+        let title = if down > 0 {
+            format!("KubeSpan ({down} links down)")
+        } else {
+            "KubeSpan".to_string()
+        };
+        let name_width = nodes
+            .iter()
+            .map(|n| n.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(title.chars().count());
+        let mut widths = vec![Constraint::Length(name_width as u16)];
+        widths.extend(
+            nodes
+                .iter()
+                .map(|n| Constraint::Length(n.chars().count().max(1) as u16)),
+        );
+        let mut header = vec![Cell::from(Span::styled(
+            title.clone(),
+            if down > 0 {
+                Style::default().fg(Color::Red).bold()
+            } else {
+                Style::default().fg(Color::Gray).bold()
+            },
+        ))];
+        header.extend(nodes.iter().map(|n| Cell::from(n.clone())));
+        let header = Row::new(header).style(Style::default().fg(Color::Gray).bold());
+        frame.render_widget(
+            Table::new(rows, widths).header(header).column_spacing(2),
+            area,
+        );
     }
 
     /// Service × node matrix: one row per service seen on any node in the
@@ -3960,6 +4181,67 @@ impl ClusterComponent {
                 ]));
             }
             resource_lines.extend(wrap_list(" DNS:    ", &net.dns_servers, width, value));
+
+            if let Some(ts) = &net.tailscale {
+                let mut spans = vec![Span::styled(" TS:     ", Style::default().dim())];
+                if ts.up {
+                    spans.push(Span::styled(
+                        tailnet_ip(ts).unwrap_or("no IP").to_string(),
+                        value,
+                    ));
+                    spans.push(Span::styled(
+                        format!(
+                            "  {} tailnet peers{}",
+                            ts.peer_routes,
+                            ts.mtu.map(|m| format!("  mtu {m}")).unwrap_or_default()
+                        ),
+                        Style::default().dim(),
+                    ));
+                } else {
+                    spans.push(Span::styled("down", Style::default().fg(Color::Red)));
+                }
+                resource_lines.push(Line::from(spans));
+                // Often dozens: a count keeps the services list in view
+                if !ts.subnet_routes.is_empty() {
+                    resource_lines.push(Line::from(vec![
+                        Span::styled(" Routes: ", Style::default().dim()),
+                        Span::styled(
+                            format!("{} subnet routes via the tailnet", ts.subnet_routes.len()),
+                            Style::default().dim(),
+                        ),
+                    ]));
+                }
+            }
+            if let Some(peers) = net.kubespan_peers.as_ref().filter(|p| !p.is_empty()) {
+                let mut spans = vec![Span::styled(" KSpan:  ", Style::default().dim())];
+                let mut peers: Vec<_> = peers.iter().collect();
+                peers.sort_by(|a, b| a.label.cmp(&b.label));
+                for (i, p) in peers.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw("  "));
+                    }
+                    let color = match p.state.as_str() {
+                        "up" => Color::Green,
+                        "down" => Color::Red,
+                        _ => Color::Yellow,
+                    };
+                    spans.push(Span::styled(
+                        format!("{} {}", p.label, p.state),
+                        Style::default().fg(color),
+                    ));
+                    if let Some(rtt) = p.rtt_ms {
+                        spans.push(Span::styled(format!(" {rtt:.0}ms"), Style::default().dim()));
+                    }
+                }
+                resource_lines.push(Line::from(spans));
+            }
+        }
+        if let Some(clock) = self.get_node_clock_for(self.active_cluster, &node_name) {
+            resource_lines.push(Line::from(vec![
+                Span::styled(" Clock:  ", Style::default().dim()),
+                clock_span(clock),
+                Span::styled(format!(" vs {}", clock.server), Style::default().dim()),
+            ]));
         }
 
         // Split into resources (sized to its lines plus a spacer) and services
@@ -4212,6 +4494,37 @@ mod tests {
     /// runs on control planes), then a roster `controlplane` member, then the
     /// endpoint. Guards the fix that pins the K8s client to the launched
     /// `--context` instead of an ambient KUBECONFIG.
+    #[test]
+    fn clock_offsets_are_formatted_and_colored_by_size() {
+        let clock = |offset_secs| NodeClock {
+            offset_secs,
+            server: "ntp1.hetzner.de".to_string(),
+        };
+        let span = clock_span(&clock(0.012));
+        assert_eq!(span.content, "+12ms");
+        assert_eq!(span.style.fg, Some(Color::Green));
+        let span = clock_span(&clock(-0.25));
+        assert_eq!(span.content, "-250ms");
+        assert_eq!(span.style.fg, Some(Color::Yellow));
+        let span = clock_span(&clock(3.0));
+        assert_eq!(span.content, "+3.0s");
+        assert_eq!(span.style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn tailnet_ip_prefers_ipv4_without_prefix() {
+        let ts = talos_rs::TailscaleLink {
+            up: true,
+            addresses: vec![
+                "fd7a:115c:a1e0::e/128".to_string(),
+                "100.64.0.14/32".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(tailnet_ip(&ts), Some("100.64.0.14"));
+        assert_eq!(tailnet_ip(&talos_rs::TailscaleLink::default()), None);
+    }
+
     #[test]
     fn control_plane_ip_prefers_etcd_then_roster_then_endpoint() {
         let etcd_member = EtcdMemberInfo {

@@ -101,7 +101,7 @@ pub struct MachineConfigInfo {
 }
 
 /// KubeSpan peer status from KubeSpanPeerStatus resource
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KubeSpanPeerStatus {
     /// Peer ID (usually the node name or public key)
     pub id: String,
@@ -723,6 +723,28 @@ pub struct NodeNetworkInfo {
     pub dns_servers: Vec<String>,
     /// `NetworkStatus.connectivityReady`, `None` if it could not be read
     pub connectivity_ready: Option<bool>,
+    /// The Tailscale extension's `tailscale0` link, `None` when the node
+    /// has none (or it could not be read)
+    pub tailscale: Option<TailscaleLink>,
+    /// KubeSpan peers as this node sees them; `None` if they could not be
+    /// read, empty when KubeSpan is off
+    pub kubespan_peers: Option<Vec<KubeSpanPeerStatus>>,
+}
+
+/// State of a node's `tailscale0` link, from Talos network resources
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TailscaleLink {
+    /// Link is up (a tun device reports no operational state, so this is
+    /// `linkState`)
+    pub up: bool,
+    pub mtu: Option<u64>,
+    /// Tailnet addresses, link-local left out
+    pub addresses: Vec<String>,
+    /// Routes via `tailscale0` to tailnet hosts (`100.64.0.0/10`,
+    /// `fd7a:115c:a1e0::/48`): roughly the peers this node knows
+    pub peer_routes: usize,
+    /// Other routes via `tailscale0`: subnet routes advertised by peers
+    pub subnet_routes: Vec<String>,
 }
 
 /// Upper bound for each per-node `talosctl get` (see [`get_resource_yaml`])
@@ -805,7 +827,7 @@ pub async fn get_node_network_info(
     node_ip: &str,
     config_path: Option<&str>,
 ) -> Result<NodeNetworkInfo, TalosError> {
-    let (addresses, routes, resolvers, status) = tokio::join!(
+    let (addresses, routes, resolvers, status, ts_link, address_status, kubespan) = tokio::join!(
         get_resource_yaml(
             Some(context),
             node_ip,
@@ -815,13 +837,34 @@ pub async fn get_node_network_info(
         get_resource_yaml(Some(context), node_ip, config_path, &["routestatus"]),
         get_resource_yaml(Some(context), node_ip, config_path, &["resolvers"]),
         get_resource_yaml(Some(context), node_ip, config_path, &["networkstatus"]),
+        get_resource_yaml(
+            Some(context),
+            node_ip,
+            config_path,
+            &["linkstatus", TAILSCALE_LINK]
+        ),
+        get_resource_yaml(Some(context), node_ip, config_path, &["addressstatus"]),
+        get_resource_yaml(Some(context), node_ip, config_path, &["kubespanpeerstatus"]),
     );
 
     if let (Err(e), Err(_), Err(_), Err(_)) = (&addresses, &routes, &resolvers, &status) {
         return Err(TalosError::Connection(e.to_string()));
     }
 
+    // No tailscale0 link (the get fails with NotFound): no Tailscale
+    let tailscale = ts_link.ok().and_then(|link| {
+        parse_tailscale_link(
+            &link,
+            address_status.as_deref().unwrap_or(""),
+            routes.as_deref().unwrap_or(""),
+        )
+    });
+
     Ok(NodeNetworkInfo {
+        tailscale,
+        kubespan_peers: kubespan
+            .ok()
+            .and_then(|y| parse_kubespan_peers_yaml(&y).ok()),
         addresses: addresses
             .map(|y| parse_spec_string_list(&y, "addresses"))
             .unwrap_or_default(),
@@ -874,6 +917,64 @@ fn parse_default_gateways(yaml_str: &str) -> Vec<String> {
         }
     }
     gateways
+}
+
+/// Link created by the Tailscale system extension
+const TAILSCALE_LINK: &str = "tailscale0";
+
+/// `tailscale0` state from its LinkStatus, its addresses from AddressStatus
+/// and its routes from RouteStatus documents
+fn parse_tailscale_link(link: &str, addresses: &str, routes: &str) -> Option<TailscaleLink> {
+    let spec = yaml_specs(link).next()?;
+    let on_link = |spec: &serde_yaml::Value, key: &str| {
+        spec.get(key).and_then(|v| v.as_str()) == Some(TAILSCALE_LINK)
+    };
+    let addresses = yaml_specs(addresses)
+        .filter(|spec| on_link(spec, "linkName"))
+        .filter_map(|spec| spec.get("address")?.as_str().map(str::to_string))
+        .filter(|a| !a.starts_with("fe80:"))
+        .collect();
+    let mut peer_routes = 0;
+    let mut subnet_routes = Vec::new();
+    for spec in yaml_specs(routes).filter(|spec| on_link(spec, "outLinkName")) {
+        let Some(dst) = spec.get("dst").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if dst.is_empty() || dst.starts_with("fe80:") {
+            continue;
+        }
+        if is_tailnet_address(dst) {
+            peer_routes += 1;
+        } else if !subnet_routes.iter().any(|r| r == dst) {
+            subnet_routes.push(dst.to_string());
+        }
+    }
+    Some(TailscaleLink {
+        up: spec
+            .get("linkState")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        mtu: spec.get("mtu").and_then(|v| v.as_u64()),
+        addresses,
+        peer_routes,
+        subnet_routes,
+    })
+}
+
+/// Whether a route destination is a tailnet address: in `100.64.0.0/10`
+/// (CGNAT) or Tailscale's `fd7a:115c:a1e0::/48`
+fn is_tailnet_address(dst: &str) -> bool {
+    if dst.starts_with("fd7a:115c:a1e0:") {
+        return true;
+    }
+    let ip = dst.split('/').next().unwrap_or(dst);
+    match ip.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => {
+            let [a, b, ..] = ip.octets();
+            a == 100 && (64..128).contains(&b)
+        }
+        Err(_) => false,
+    }
 }
 
 /// `connectivityReady` from the NetworkStatus resource
@@ -1464,6 +1565,36 @@ fn parse_duration_to_ms(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_tailscale_link_addresses_and_routes() {
+        let link = "spec:\n    mtu: 1280\n    operationalState: unknown\n    linkState: true\n";
+        let addresses = "\
+spec:\n    address: 100.64.0.14/32\n    linkName: tailscale0\n---
+spec:\n    address: fe80::89ef:d775:4055:c2da/64\n    linkName: tailscale0\n---
+spec:\n    address: 37.27.227.99/26\n    linkName: enp0s31f6\n";
+        let routes = "\
+spec:\n    dst: 100.64.0.20/32\n    outLinkName: tailscale0\n    table: \"52\"\n---
+spec:\n    dst: fd7a:115c:a1e0::14/128\n    outLinkName: tailscale0\n---
+spec:\n    dst: 10.107.0.0/16\n    outLinkName: tailscale0\n---
+spec:\n    dst: \"\"\n    gateway: 37.27.227.65\n    outLinkName: enp0s31f6\n";
+        let ts = parse_tailscale_link(link, addresses, routes).unwrap();
+        assert!(ts.up);
+        assert_eq!(ts.mtu, Some(1280));
+        assert_eq!(ts.addresses, ["100.64.0.14/32"]);
+        assert_eq!(ts.peer_routes, 2);
+        assert_eq!(ts.subnet_routes, ["10.107.0.0/16"]);
+        assert!(parse_tailscale_link("", addresses, routes).is_none());
+    }
+
+    #[test]
+    fn tailnet_addresses() {
+        assert!(is_tailnet_address("100.64.0.1/32"));
+        assert!(is_tailnet_address("100.127.255.1/32"));
+        assert!(!is_tailnet_address("100.128.0.1/32"));
+        assert!(!is_tailnet_address("10.10.0.0/16"));
+        assert!(is_tailnet_address("fd7a:115c:a1e0::e/128"));
+    }
 
     #[test]
     fn test_parse_volume_status() {

@@ -110,8 +110,8 @@ pub use config::{Context, TalosConfig};
 pub use error::TalosError;
 pub use talosctl::{
     AddressStatus, DiscoveryMember, DiskInfo, GenConfigResult, InsecureApplyResult,
-    InsecureVersionInfo, KubeSpanPeerStatus, MachineConfigInfo, NodeNetworkInfo, VolumeStatus,
-    apply_config_insecure, check_insecure_connection, gen_config, get_address_status,
+    InsecureVersionInfo, KubeSpanPeerStatus, MachineConfigInfo, NodeNetworkInfo, TailscaleLink,
+    VolumeStatus, apply_config_insecure, check_insecure_connection, gen_config, get_address_status,
     get_discovery_members, get_discovery_members_for_context, get_discovery_members_with_retry,
     get_disks, get_disks_for_context, get_disks_for_node, get_disks_insecure, get_kubespan_peers,
     get_kubespan_peers_for_node, get_machine_config, get_machine_config_for_node,
