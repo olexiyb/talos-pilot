@@ -36,6 +36,8 @@ arboard.workspace = true
 # Kubernetes client
 kube.workspace = true
 k8s-openapi.workspace = true
+# Raw requests through kube (LINSTOR API via the service proxy)
+http = "1"
 
 # Serialization
 serde_yaml.workspace = true

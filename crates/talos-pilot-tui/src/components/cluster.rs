@@ -3,6 +3,7 @@
 use crate::action::Action;
 use crate::components::diagnostics::k8s;
 use crate::components::{Component, ProcessNode};
+use crate::linstor::{LinstorNode, LinstorStatus, StoragePool, fetch_linstor};
 use crate::reachability::prefer_reachable_addresses;
 use crate::zfs::{ZfsPool, fetch_zfs_pools};
 use color_eyre::Result;
@@ -215,6 +216,8 @@ struct ClusterData {
     zfs_pools: HashMap<String, Vec<ZfsPool>>,
     /// Kubelet version per lowercased Kubernetes node name
     kubelet_versions: HashMap<String, String>,
+    /// LINSTOR state when the cluster runs Piraeus, `None` otherwise
+    linstor: Option<LinstorStatus>,
     /// Known nodes that did not answer the last refresh, by node name. They
     /// stay in `versions` (as placeholders) so they show as offline.
     offline: HashMap<String, OfflineNode>,
@@ -622,7 +625,8 @@ impl ClusterData {
 
         let cp_ip = cluster.control_plane_ip();
 
-        // ZFS pool capacity and kubelet versions from the Kubernetes API.
+        // ZFS pool capacity, kubelet versions and LINSTOR nodes from the
+        // Kubernetes API.
         // Bounded so an unreachable kube-apiserver can't stall the refresh; on
         // failure the previous values are kept.
         let k8s_data = tokio::time::timeout(K8S_QUERY_TIMEOUT, async {
@@ -636,12 +640,17 @@ impl ClusterData {
             let k8s = cluster.k8s_client.as_ref()?;
             Some(tokio::join!(
                 fetch_zfs_pools(k8s),
-                fetch_kubelet_versions(k8s)
+                fetch_kubelet_versions(k8s),
+                fetch_linstor(k8s)
             ))
         })
         .await;
         match k8s_data {
-            Ok(Some((zfs, kubelets))) => {
+            Ok(Some((zfs, kubelets, linstor))) => {
+                match linstor {
+                    Ok(status) => cluster.linstor = status,
+                    Err(e) => tracing::debug!("LINSTOR unavailable for {}: {}", cluster.name, e),
+                }
                 match zfs {
                     Ok(pools) => cluster.zfs_pools = pools,
                     Err(e) => tracing::debug!("ZFS pools unavailable for {}: {}", cluster.name, e),
@@ -904,8 +913,8 @@ fn memory_color(pct: f32) -> Color {
     }
 }
 
-/// Upper bound for the kube-apiserver queries (ZFS pools, kubelet versions)
-/// in a cluster refresh
+/// Upper bound for the kube-apiserver queries (ZFS pools, kubelet versions,
+/// LINSTOR nodes) in a cluster refresh
 const K8S_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Kubelet version of every Kubernetes node, keyed by lowercased node name
@@ -923,6 +932,145 @@ async fn fetch_kubelet_versions(
             Some((node.metadata.name?.to_lowercase(), version))
         })
         .collect())
+}
+
+/// LINSTOR node list (`linstor node list`) of a Piraeus cluster, or why the
+/// controller couldn't be queried
+fn draw_linstor_table(frame: &mut Frame, area: Rect, linstor: Result<Vec<&LinstorNode>, &str>) {
+    let dim = Style::default().dim();
+    let rows = match linstor {
+        Ok(rows) => rows,
+        Err(e) => {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("LINSTOR  ", Style::default().fg(Color::Gray).bold()),
+                    Span::styled(
+                        format!("controller API unreachable: {e}"),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ])),
+                area,
+            );
+            return;
+        }
+    };
+
+    let online = rows.iter().filter(|n| n.is_online()).count();
+    let title = if rows.is_empty() {
+        "LINSTOR (no nodes)".to_string()
+    } else {
+        format!("LINSTOR ({}/{} online)", online, rows.len())
+    };
+    let name_width = rows
+        .iter()
+        .map(|n| n.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(title.chars().count());
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .map(|node| {
+            let mut state = node.state.clone();
+            for flag in &node.flags {
+                state.push_str(", ");
+                state.push_str(flag);
+            }
+            let state_color = if node.is_online() {
+                Color::Green
+            } else if node.state.eq_ignore_ascii_case("ONLINE") {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            Row::new(vec![
+                Cell::from(node.name.clone()),
+                Cell::from(Span::styled(node.node_type.to_lowercase(), dim)),
+                Cell::from(Span::styled(state, Style::default().fg(state_color))),
+                Cell::from(pools_line(node.pools.as_deref())),
+                Cell::from(Span::styled(node.addresses.join(", "), dim)),
+            ])
+        })
+        .collect();
+    let state_width = rows
+        .iter()
+        .map(|n| {
+            n.state.chars().count() + n.flags.iter().map(|f| f.chars().count() + 2).sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0)
+        .max(5);
+    let pools_width = rows
+        .iter()
+        .map(|n| pools_line(n.pools.as_deref()).width())
+        .max()
+        .unwrap_or(0)
+        .max(5);
+    let widths = [
+        Constraint::Length(name_width as u16),
+        Constraint::Length(9),
+        Constraint::Length(state_width as u16),
+        Constraint::Length(pools_width as u16),
+        Constraint::Fill(1),
+    ];
+    let header = Row::new(vec![title.as_str(), "Type", "State", "Pools", "Addresses"])
+        .style(Style::default().fg(Color::Gray).bold());
+    frame.render_widget(
+        Table::new(table_rows, widths)
+            .header(header)
+            .column_spacing(2),
+        area,
+    );
+}
+
+/// A node's LINSTOR storage pools, e.g. `datapool 287/840G 34%`: usage
+/// colored like memory, a pool with error/warning reports in red. `?` when
+/// the pool list couldn't be fetched, `-` for a node without pools.
+fn pools_line(pools: Option<&[StoragePool]>) -> Line<'static> {
+    let dim = Style::default().dim();
+    let Some(pools) = pools else {
+        return Line::from(Span::styled("?", dim));
+    };
+    if pools.is_empty() {
+        return Line::from(Span::styled("-", dim));
+    }
+    let mut spans = Vec::new();
+    for (i, pool) in pools.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(", ", dim));
+        }
+        let name_style = if pool.has_problems {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(pool.name.clone(), name_style));
+        match (pool.free, pool.total, pool.used_pct()) {
+            (Some(free), Some(total), Some(pct)) => {
+                spans.push(Span::styled(
+                    format!(" {}", used_of_total(total.saturating_sub(free), total)),
+                    dim,
+                ));
+                spans.push(Span::styled(
+                    format!(" {:.0}%", pct),
+                    Style::default().fg(memory_color(pct)),
+                ));
+            }
+            _ => spans.push(Span::styled(" ?", dim)),
+        }
+    }
+    Line::from(spans)
+}
+
+/// `used/total` in the total's unit, e.g. `287/840G` or `0.4/6.8T`
+fn used_of_total(used: u64, total: u64) -> String {
+    const TIB: f64 = (1u64 << 40) as f64;
+    if total as f64 >= TIB {
+        let precision = |v: f64| if v < 10.0 { 1 } else { 0 };
+        let (u, t) = (used as f64 / TIB, total as f64 / TIB);
+        format!("{u:.p$}/{t:.q$}T", p = precision(u), q = precision(t))
+    } else {
+        format!("{:.0}/{:.0}G", gib(used), gib(total))
+    }
 }
 
 /// Bytes to GiB, for display
@@ -3197,13 +3345,23 @@ impl ClusterComponent {
         let header = Row::new(header).style(Style::default().fg(Color::Gray).bold());
         let table = Table::new(rows, widths).header(header).column_spacing(2);
 
-        let [table_area, services_area, hint_area] = Layout::vertical([
+        let linstor = self.linstor_rows_for(cluster_idx, &nodes);
+        let linstor_height = match &linstor {
+            Some(Ok(rows)) => rows.len() as u16 + 2, // header + rows + spacer
+            Some(Err(_)) => 2,
+            None => 0,
+        };
+        let [table_area, linstor_area, services_area, hint_area] = Layout::vertical([
             Constraint::Length(nodes.len() as u16 + 2), // header + rows + spacer
+            Constraint::Length(linstor_height),
             Constraint::Min(2),
             Constraint::Length(1),
         ])
         .areas(inner);
         frame.render_widget(table, table_area);
+        if let Some(linstor) = linstor {
+            draw_linstor_table(frame, linstor_area, linstor);
+        }
         self.draw_services_matrix(frame, services_area, cluster_idx, &nodes);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -3222,6 +3380,30 @@ impl ClusterComponent {
             ])),
             hint_area,
         );
+    }
+
+    /// LINSTOR nodes to show for the selection: all of them for a cluster
+    /// header, otherwise those of the group's nodes. `None` when the cluster
+    /// doesn't run Piraeus (or the group has no LINSTOR nodes); `Err` when the
+    /// controller API is unreachable.
+    fn linstor_rows_for<'a>(
+        &'a self,
+        cluster_idx: usize,
+        nodes: &[String],
+    ) -> Option<Result<Vec<&'a LinstorNode>, &'a str>> {
+        let whole_cluster = matches!(self.selected_item, NodeListItem::ClusterHeader(_));
+        match self.clusters.get(cluster_idx)?.linstor.as_ref()? {
+            LinstorStatus::Unreachable(e) => Some(Err(e.as_str())),
+            LinstorStatus::Nodes(all) => {
+                let rows: Vec<&LinstorNode> = all
+                    .iter()
+                    .filter(|l| {
+                        whole_cluster || nodes.iter().any(|n| n.eq_ignore_ascii_case(&l.name))
+                    })
+                    .collect();
+                (whole_cluster || !rows.is_empty()).then_some(Ok(rows))
+            }
+        }
     }
 
     /// Service × node matrix: one row per service seen on any node in the

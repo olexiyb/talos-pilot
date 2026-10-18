@@ -2812,6 +2812,7 @@ dependencies = [
  "crossterm",
  "dirs-next",
  "futures",
+ "http",
  "k8s-openapi",
  "kube",
  "ratatui",
