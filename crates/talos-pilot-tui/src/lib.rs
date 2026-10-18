@@ -9,6 +9,7 @@ pub mod audit;
 pub mod clipboard;
 pub mod components;
 pub mod linstor;
+pub mod linstor_volumes;
 pub mod reachability;
 pub mod tui;
 pub mod ui_ext;

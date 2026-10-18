@@ -70,10 +70,11 @@ pub enum NavMenuItem {
     Certs,
     Lifecycle,
     Workloads,
+    Volumes,
 }
 
 impl NavMenuItem {
-    const ALL: [NavMenuItem; 9] = [
+    const ALL: [NavMenuItem; 10] = [
         NavMenuItem::Logs,
         NavMenuItem::Etcd,
         NavMenuItem::Network,
@@ -83,6 +84,7 @@ impl NavMenuItem {
         NavMenuItem::Certs,
         NavMenuItem::Lifecycle,
         NavMenuItem::Workloads,
+        NavMenuItem::Volumes,
     ];
 
     fn label(&self) -> &'static str {
@@ -96,6 +98,7 @@ impl NavMenuItem {
             NavMenuItem::Certs => "Certs",
             NavMenuItem::Lifecycle => "Life",
             NavMenuItem::Workloads => "Work",
+            NavMenuItem::Volumes => "Vol",
         }
     }
 
@@ -110,6 +113,7 @@ impl NavMenuItem {
             NavMenuItem::Certs => "c",
             NavMenuItem::Lifecycle => "y",
             NavMenuItem::Workloads => "w",
+            NavMenuItem::Volumes => "v",
         }
     }
 }
@@ -1214,6 +1218,19 @@ impl ClusterComponent {
         }
     }
 
+    /// LINSTOR volumes view for the selection, scoped like `workloads_action`
+    fn volumes_action(&self) -> Action {
+        match self.workloads_action() {
+            Action::ShowWorkloads(title, nodes) => Action::ShowLinstorVolumes(title, nodes),
+            other => other,
+        }
+    }
+
+    /// Talos address of every node in the active cluster, by node name
+    pub fn active_node_ips(&self) -> HashMap<String, String> {
+        self.node_ips().clone()
+    }
+
     /// Whether a node is a control plane node (see `ClusterData::is_controlplane`)
     fn node_is_controlplane(&self, cluster_idx: usize, node: &str) -> bool {
         self.clusters
@@ -2133,6 +2150,7 @@ impl ClusterComponent {
             NavMenuItem::Certs => Ok(Some(Action::ShowSecurity)),
             NavMenuItem::Lifecycle => Ok(Some(Action::ShowLifecycle)),
             NavMenuItem::Workloads => Ok(Some(self.workloads_action())),
+            NavMenuItem::Volumes => Ok(Some(self.volumes_action())),
         }
     }
 }
@@ -2451,6 +2469,7 @@ impl Component for ClusterComponent {
             KeyCode::Char('c') => Ok(Some(Action::ShowSecurity)),
             KeyCode::Char('y') => Ok(Some(Action::ShowLifecycle)),
             KeyCode::Char('w') => Ok(Some(self.workloads_action())),
+            KeyCode::Char('v') => Ok(Some(self.volumes_action())),
             KeyCode::Char('o') => {
                 // Show node operations overlay for selected node
                 if let Some(node_name) = self.current_node_name() {

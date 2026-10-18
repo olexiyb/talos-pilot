@@ -46,6 +46,9 @@ pub enum Action {
     /// Show workload health view: (title, nodes to limit it to, or `None`
     /// for the whole cluster)
     ShowWorkloads(String, Option<Vec<String>>),
+    /// Show LINSTOR volumes view: (title, nodes to limit it to, or `None`
+    /// for the whole cluster)
+    ShowLinstorVolumes(String, Option<Vec<String>>),
     /// Show storage/disks view for a node: (hostname, address)
     ShowStorage(String, String),
     /// Show node operations overlay: (hostname, address, is_controlplane)

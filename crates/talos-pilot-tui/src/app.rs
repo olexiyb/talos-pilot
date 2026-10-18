@@ -6,8 +6,9 @@ use crate::components::rolling_operations::RollingNodeInfo;
 use crate::components::wizard::{WizardComponent, WizardState};
 use crate::components::{
     ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent,
-    MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent,
-    RollingOperationsComponent, SecurityComponent, StorageComponent, WorkloadHealthComponent,
+    LinstorVolumesComponent, MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent,
+    ProcessesComponent, RollingOperationsComponent, SecurityComponent, StorageComponent,
+    WorkloadHealthComponent,
 };
 use crate::tui::{self, Tui};
 use color_eyre::Result;
@@ -27,6 +28,7 @@ enum RefreshJob {
     Storage(JoinHandle<StorageComponent>),
     Processes(JoinHandle<ProcessesComponent>),
     Etcd(JoinHandle<EtcdComponent>),
+    Volumes(JoinHandle<LinstorVolumesComponent>),
 }
 
 impl RefreshJob {
@@ -39,6 +41,7 @@ impl RefreshJob {
             RefreshJob::Storage(h) => h.is_finished(),
             RefreshJob::Processes(h) => h.is_finished(),
             RefreshJob::Etcd(h) => h.is_finished(),
+            RefreshJob::Volumes(h) => h.is_finished(),
         }
     }
 
@@ -51,6 +54,7 @@ impl RefreshJob {
             RefreshJob::Storage(h) => h.abort(),
             RefreshJob::Processes(h) => h.abort(),
             RefreshJob::Etcd(h) => h.abort(),
+            RefreshJob::Volumes(h) => h.abort(),
         }
     }
 }
@@ -92,6 +96,7 @@ enum View {
     Security,
     Lifecycle,
     Workloads,
+    Volumes,
     Storage,
     NodeOperations,
     RollingOperations,
@@ -109,6 +114,8 @@ pub struct App {
     multi_logs: Option<MultiLogsComponent>,
     /// Log levels last shown in the logs view, restored when it is reopened
     log_level_filter: crate::components::multi_logs::LevelFilter,
+    /// Volumes view toggle, filter and selection, kept across visits
+    volumes_view_state: Option<crate::components::linstor_volumes::VolumesViewState>,
     /// Etcd status component (created when viewing etcd)
     etcd: Option<EtcdComponent>,
     /// Processes component (created when viewing processes)
@@ -123,6 +130,8 @@ pub struct App {
     lifecycle: Option<LifecycleComponent>,
     /// Workload health component (created when viewing workloads)
     workloads: Option<WorkloadHealthComponent>,
+    /// LINSTOR volumes component (created when viewing volumes)
+    volumes: Option<LinstorVolumesComponent>,
     /// Storage component (created when viewing disks/volumes)
     storage: Option<StorageComponent>,
     /// Node operations component (overlay for node operations)
@@ -182,6 +191,7 @@ impl App {
             cluster: ClusterComponent::new(config_path.clone(), context),
             multi_logs: None,
             log_level_filter: crate::components::multi_logs::ALL_LEVELS,
+            volumes_view_state: None,
             etcd: None,
             processes: None,
             network: None,
@@ -189,6 +199,7 @@ impl App {
             security: None,
             lifecycle: None,
             workloads: None,
+            volumes: None,
             storage: None,
             node_operations: None,
             rolling_operations: None,
@@ -621,6 +632,11 @@ impl App {
                             let _ = workloads.draw(frame, area);
                         }
                     }
+                    View::Volumes => {
+                        if let Some(volumes) = &mut self.volumes {
+                            let _ = volumes.draw(frame, area);
+                        }
+                    }
                     View::Storage => {
                         if let Some(storage) = &mut self.storage {
                             let _ = storage.draw(frame, area);
@@ -752,6 +768,11 @@ impl App {
                     c.adopt_refresh(r);
                 }
             }
+            RefreshJob::Volumes(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.volumes, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
         }
     }
 
@@ -847,6 +868,13 @@ impl App {
                     None
                 }
             }
+            View::Volumes => {
+                if let Some(volumes) = &mut self.volumes {
+                    volumes.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
             View::Workloads => {
                 if let Some(workloads) = &mut self.workloads {
                     workloads.handle_key_event(key)?
@@ -928,6 +956,11 @@ impl App {
                     }
                     View::Workloads => {
                         self.workloads = None;
+                    }
+                    View::Volumes => {
+                        if let Some(volumes) = self.volumes.take() {
+                            self.volumes_view_state = Some(volumes.view_state());
+                        }
                     }
                     View::Storage => {
                         self.storage = None;
@@ -1014,6 +1047,13 @@ impl App {
                     View::Workloads => {
                         if let Some(workloads) = &mut self.workloads
                             && let Some(next_action) = workloads.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Volumes => {
+                        if let Some(volumes) = &mut self.volumes
+                            && let Some(next_action) = volumes.update(Action::Tick)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
@@ -1114,6 +1154,14 @@ impl App {
                         {
                             self.refresh_job =
                                 Some(RefreshJob::Workloads(spawn_refresh!(workloads)));
+                        }
+                    }
+                    View::Volumes => {
+                        // Hundreds of kernel reads: refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(volumes) = &self.volumes
+                        {
+                            self.refresh_job = Some(RefreshJob::Volumes(spawn_refresh!(volumes)));
                         }
                     }
                     View::Storage => {
@@ -1378,6 +1426,31 @@ impl App {
                 self.workloads = Some(workloads);
                 self.view = View::Workloads;
             }
+            Action::ShowLinstorVolumes(title, nodes) => {
+                self.cancel_refresh_job();
+                tracing::info!("ShowLinstorVolumes: '{}'", title);
+
+                let mut volumes = LinstorVolumesComponent::new(title, nodes);
+                if let Some(state) = self.volumes_view_state.clone() {
+                    volumes.set_view_state(state);
+                }
+                let cp_ip = self.cluster.control_plane_ip();
+                if let Some(talos_client) = self.cluster.client() {
+                    volumes.set_clients(
+                        talos_client.clone(),
+                        self.cluster.active_node_ips(),
+                        cp_ip,
+                    );
+                    // First scan in the background; the view shows a
+                    // scanning message until it lands
+                    self.refresh_job = Some(RefreshJob::Volumes(spawn_refresh!(volumes)));
+                } else {
+                    volumes.set_error("Not connected".to_string());
+                }
+
+                self.volumes = Some(volumes);
+                self.view = View::Volumes;
+            }
             Action::ShowStorage(hostname, address) => {
                 self.cancel_refresh_job();
                 // Switch to storage view for a node
@@ -1532,6 +1605,13 @@ impl App {
                     View::Lifecycle => {
                         if let Some(lifecycle) = &mut self.lifecycle
                             && let Some(next_action) = lifecycle.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Volumes => {
+                        if let Some(volumes) = &mut self.volumes
+                            && let Some(next_action) = volumes.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
