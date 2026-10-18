@@ -731,48 +731,32 @@ impl App {
         let Some(job) = self.refresh_job.take() else {
             return;
         };
-        // A panicked or aborted task yields nothing; the next auto-refresh retries
+        // A panicked task is shown as the view's error: that ends its loading
+        // state, so auto-refresh retries instead of "Loading..." forever.
+        // (Aborted jobs never get here: cancelling takes them out first.)
+        macro_rules! finish {
+            ($slot:expr, $handle:expr) => {
+                if let Some(c) = &mut $slot {
+                    match $handle.now_or_never() {
+                        Some(Ok(refreshed)) => c.adopt_refresh(refreshed),
+                        Some(Err(e)) => {
+                            tracing::error!("View refresh task failed: {}", e);
+                            c.set_error(format!("Refresh failed: {e}"));
+                        }
+                        None => {}
+                    }
+                }
+            };
+        }
         match job {
-            RefreshJob::Diagnostics(h) => {
-                if let (Some(c), Some(Ok(r))) = (&mut self.diagnostics, h.now_or_never()) {
-                    c.adopt_refresh(r);
-                }
-            }
-            RefreshJob::Security(h) => {
-                if let (Some(c), Some(Ok(r))) = (&mut self.security, h.now_or_never()) {
-                    c.adopt_refresh(r);
-                }
-            }
-            RefreshJob::Lifecycle(h) => {
-                if let (Some(c), Some(Ok(r))) = (&mut self.lifecycle, h.now_or_never()) {
-                    c.adopt_refresh(r);
-                }
-            }
-            RefreshJob::Workloads(h) => {
-                if let (Some(c), Some(Ok(r))) = (&mut self.workloads, h.now_or_never()) {
-                    c.adopt_refresh(r);
-                }
-            }
-            RefreshJob::Storage(h) => {
-                if let (Some(c), Some(Ok(r))) = (&mut self.storage, h.now_or_never()) {
-                    c.adopt_refresh(r);
-                }
-            }
-            RefreshJob::Processes(h) => {
-                if let (Some(c), Some(Ok(r))) = (&mut self.processes, h.now_or_never()) {
-                    c.adopt_refresh(r);
-                }
-            }
-            RefreshJob::Etcd(h) => {
-                if let (Some(c), Some(Ok(r))) = (&mut self.etcd, h.now_or_never()) {
-                    c.adopt_refresh(r);
-                }
-            }
-            RefreshJob::Volumes(h) => {
-                if let (Some(c), Some(Ok(r))) = (&mut self.volumes, h.now_or_never()) {
-                    c.adopt_refresh(r);
-                }
-            }
+            RefreshJob::Diagnostics(h) => finish!(self.diagnostics, h),
+            RefreshJob::Security(h) => finish!(self.security, h),
+            RefreshJob::Lifecycle(h) => finish!(self.lifecycle, h),
+            RefreshJob::Workloads(h) => finish!(self.workloads, h),
+            RefreshJob::Storage(h) => finish!(self.storage, h),
+            RefreshJob::Processes(h) => finish!(self.processes, h),
+            RefreshJob::Etcd(h) => finish!(self.etcd, h),
+            RefreshJob::Volumes(h) => finish!(self.volumes, h),
         }
     }
 

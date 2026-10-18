@@ -42,6 +42,9 @@ pub struct AsyncState<T> {
     last_refresh: Option<Instant>,
     /// Number of consecutive failures (for retry logic)
     retry_count: u32,
+    /// When the last load failed, so auto-refresh retries on its interval
+    /// rather than on every tick
+    last_error_at: Option<Instant>,
 }
 
 impl<T> Default for AsyncState<T> {
@@ -59,6 +62,7 @@ impl<T> AsyncState<T> {
             error: None,
             last_refresh: None,
             retry_count: 0,
+            last_error_at: None,
         }
     }
 
@@ -70,6 +74,7 @@ impl<T> AsyncState<T> {
             error: None,
             last_refresh: None,
             retry_count: 0,
+            last_error_at: None,
         }
     }
 
@@ -81,6 +86,7 @@ impl<T> AsyncState<T> {
             error: None,
             last_refresh: Some(Instant::now()),
             retry_count: 0,
+            last_error_at: None,
         }
     }
 
@@ -151,6 +157,7 @@ impl<T> AsyncState<T> {
         self.error = Some(error.to_string());
         self.loading = false;
         self.retry_count += 1;
+        self.last_error_at = Some(Instant::now());
     }
 
     /// Set an error with context about retry count
@@ -162,6 +169,7 @@ impl<T> AsyncState<T> {
             self.retry_count
         ));
         self.loading = false;
+        self.last_error_at = Some(Instant::now());
     }
 
     /// Mark the state as loaded without replacing data
@@ -188,6 +196,7 @@ impl<T> AsyncState<T> {
         self.error = None;
         self.last_refresh = None;
         self.retry_count = 0;
+        self.last_error_at = None;
     }
 
     /// Check if a refresh is needed based on the interval
@@ -199,6 +208,10 @@ impl<T> AsyncState<T> {
     /// Returns false if currently loading.
     pub fn should_refresh(&self, interval: Duration) -> bool {
         if self.loading {
+            return false;
+        }
+        // A failed load waits out the interval too
+        if self.error.is_some() && self.last_error_at.is_some_and(|at| at.elapsed() < interval) {
             return false;
         }
 
@@ -236,6 +249,7 @@ impl<T> AsyncState<T> {
             error: self.error,
             last_refresh: self.last_refresh,
             retry_count: self.retry_count,
+            last_error_at: self.last_error_at,
         }
     }
 
@@ -289,6 +303,18 @@ impl<T> AsyncStateExt<T> for AsyncState<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_load_retries_after_the_interval_not_at_once() {
+        let mut state: AsyncState<u32> = AsyncState::new();
+        state.set_error("unreachable");
+        // Never loaded, but it just failed: wait out the interval
+        assert!(!state.should_refresh(Duration::from_secs(60)));
+        assert!(state.should_refresh(Duration::ZERO));
+        // A success clears the error and the interval runs from it
+        state.set_data(1);
+        assert!(!state.should_refresh(Duration::from_secs(60)));
+    }
 
     #[test]
     fn test_new_state() {
