@@ -5,6 +5,10 @@
 //! sizes say nothing about the pool. OpenEBS ZFS LocalPV publishes each node's
 //! pools with free/used space as a `ZFSNode` resource; we read those.
 //! Clusters without OpenEBS ZFS simply report no pools.
+//!
+//! The volumes themselves (`ZFSVolume` resources) are listed too, for the
+//! volumes view: one dataset (or zvol) on one node, no replication, with its
+//! real size and usage from the Talos Mounts API.
 
 use k8s_openapi::serde_json::Value;
 use kube::Client;
@@ -29,6 +33,158 @@ impl ZfsPool {
         let size = self.size();
         (size > 0).then(|| self.used as f32 / size as f32 * 100.0)
     }
+}
+
+/// One OpenEBS ZFS LocalPV volume
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ZfsVolume {
+    /// Volume (and PV) name, e.g. `pvc-…`
+    pub name: String,
+    /// `namespace/name` of the PVC bound to the PV
+    pub pvc: Option<String>,
+    /// Node holding the dataset
+    pub node: String,
+    /// Parent dataset, e.g. `datapool/localpv`
+    pub pool: String,
+    /// Requested capacity in bytes
+    pub capacity: Option<u64>,
+    /// `Ready`, `Pending`, `Failed`
+    pub state: String,
+    /// `DATASET` or `ZVOL`
+    pub volume_type: String,
+    /// Mounted size and used bytes, from the node's mounts (datasets only)
+    pub fs: Option<(u64, u64)>,
+}
+
+impl ZfsVolume {
+    /// The dataset as it appears in the node's mounts
+    pub fn dataset(&self) -> String {
+        format!("{}/{}", self.pool, self.name)
+    }
+}
+
+/// OpenEBS ZFS LocalPV volumes with their PVC names, `None` when the
+/// `ZFSVolume` CRD isn't installed
+pub async fn fetch_zfs_volumes(client: &Client) -> Result<Option<Vec<ZfsVolume>>, kube::Error> {
+    let gvk = GroupVersionKind::gvk("zfs.openebs.io", "v1", "ZFSVolume");
+    let resource = ApiResource::from_gvk_with_plural(&gvk, "zfsvolumes");
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &resource);
+    let pvs: Api<k8s_openapi::api::core::v1::PersistentVolume> = Api::all(client.clone());
+
+    let params = ListParams::default();
+    let (volumes, pvs) = tokio::join!(api.list(&params), pvs.list(&params));
+    let volumes = match volumes {
+        Ok(list) => list,
+        Err(kube::Error::Api(e)) if e.code == 404 => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // volume handle -> PVC; without PVs the volumes are shown by name
+    let claims: HashMap<String, String> = pvs
+        .map(|list| list.items)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|pv| {
+            let spec = pv.spec?;
+            let handle = spec.csi?.volume_handle;
+            let claim = spec.claim_ref?;
+            Some((handle, format!("{}/{}", claim.namespace?, claim.name?)))
+        })
+        .collect();
+    Ok(Some(zfs_volumes_from(volumes.items, &claims)))
+}
+
+/// Parse `ZFSVolume` objects, sorted by PVC then name
+fn zfs_volumes_from(
+    objects: Vec<DynamicObject>,
+    claims: &HashMap<String, String>,
+) -> Vec<ZfsVolume> {
+    let mut volumes: Vec<ZfsVolume> = objects
+        .into_iter()
+        .filter_map(|obj| {
+            let name = obj.metadata.name?;
+            let spec = obj.data.get("spec")?;
+            let field = |key: &str| spec.get(key).and_then(Value::as_str).map(str::to_string);
+            Some(ZfsVolume {
+                pvc: claims.get(&name).cloned(),
+                node: field("ownerNodeID")?,
+                pool: field("poolName")?,
+                capacity: field("capacity").and_then(|c| c.parse().ok()),
+                state: obj
+                    .data
+                    .pointer("/status/state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown")
+                    .to_string(),
+                volume_type: field("volumeType").unwrap_or_else(|| "DATASET".to_string()),
+                fs: None,
+                name,
+            })
+        })
+        .collect();
+    volumes.sort_by(|a, b| {
+        a.pvc
+            .is_none()
+            .cmp(&b.pvc.is_none())
+            .then_with(|| a.pvc.cmp(&b.pvc))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    volumes
+}
+
+/// Set each dataset's mounted size and usage from its node's mounts
+pub fn apply_zfs_mounts(
+    volumes: &mut [ZfsVolume],
+    mounts: &HashMap<String, Vec<talos_rs::MountUsage>>,
+) {
+    for volume in volumes {
+        let dataset = volume.dataset();
+        if let Some(m) = mounts
+            .get(&volume.node)
+            .and_then(|ms| ms.iter().find(|m| m.filesystem == dataset))
+        {
+            volume.fs = Some((m.size, m.size.saturating_sub(m.available)));
+        }
+    }
+}
+
+/// A dataset whose quota is this far below its capacity wasn't resized
+const QUOTA_BELOW_CAPACITY_PCT: u64 = 90;
+
+/// Problems of a ZFS LocalPV volume, worst first
+pub fn zfs_volume_issues(volume: &ZfsVolume) -> Vec<crate::linstor_volumes::Issue> {
+    use crate::linstor_volumes::{Issue, Severity, format_kib, usage_issue};
+    let mut issues = Vec::new();
+    match volume.state.as_str() {
+        "Ready" => {}
+        "Pending" => issues.push(Issue {
+            severity: Severity::Warning,
+            text: format!("{}: volume Pending", volume.node),
+        }),
+        state => issues.push(Issue {
+            severity: Severity::Error,
+            text: format!("{}: volume {state}", volume.node),
+        }),
+    }
+    if let Some((size, used)) = volume.fs {
+        if let Some(issue) = usage_issue(&volume.node, used / 1024, size / 1024) {
+            issues.push(issue);
+        }
+        if let Some(capacity) = volume.capacity
+            && size < capacity / 100 * QUOTA_BELOW_CAPACITY_PCT
+        {
+            issues.push(Issue {
+                severity: Severity::Warning,
+                text: format!(
+                    "{}: dataset {} below capacity {}: resize not applied",
+                    volume.node,
+                    format_kib(size / 1024),
+                    format_kib(capacity / 1024)
+                ),
+            });
+        }
+    }
+    issues.sort_by_key(|i| i.severity);
+    issues
 }
 
 /// ZFS pools keyed by Kubernetes node name.
@@ -103,6 +259,58 @@ fn parse_quantity(q: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use k8s_openapi::serde_json::json;
+
+    fn zfs_volume(state: &str, capacity: u64, fs: Option<(u64, u64)>) -> ZfsVolume {
+        ZfsVolume {
+            name: "pvc-1".to_string(),
+            node: "bc2".to_string(),
+            pool: "datapool/localpv".to_string(),
+            capacity: Some(capacity),
+            state: state.to_string(),
+            volume_type: "DATASET".to_string(),
+            fs,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parses_zfs_volumes_with_their_pvcs() {
+        let obj: DynamicObject = k8s_openapi::serde_json::from_value(json!({
+            "apiVersion": "zfs.openebs.io/v1", "kind": "ZFSVolume",
+            "metadata": {"name": "pvc-1", "namespace": "openebs"},
+            "spec": {"capacity": "1073741824", "ownerNodeID": "bc2",
+                     "poolName": "datapool/localpv", "volumeType": "DATASET"},
+            "status": {"state": "Ready"}
+        }))
+        .unwrap();
+        let claims = HashMap::from([("pvc-1".to_string(), "db/data-mongo-0".to_string())]);
+        let volumes = zfs_volumes_from(vec![obj], &claims);
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].pvc.as_deref(), Some("db/data-mongo-0"));
+        assert_eq!(volumes[0].capacity, Some(1 << 30));
+        assert_eq!(volumes[0].dataset(), "datapool/localpv/pvc-1");
+    }
+
+    #[test]
+    fn zfs_volume_issues_cover_state_usage_and_resize() {
+        let gib = 1u64 << 30;
+        // Ready, quota a little above capacity (ZFS rounds up), 10% used
+        assert!(
+            zfs_volume_issues(&zfs_volume("Ready", gib, Some((gib + gib / 16, gib / 10))))
+                .is_empty()
+        );
+        // Not mounted: nothing to check but the state
+        assert!(zfs_volume_issues(&zfs_volume("Ready", gib, None)).is_empty());
+
+        let failed = zfs_volume_issues(&zfs_volume("Failed", gib, None));
+        assert_eq!(failed[0].text, "bc2: volume Failed");
+
+        let full = zfs_volume_issues(&zfs_volume("Ready", gib, Some((gib, gib * 96 / 100))));
+        assert!(full[0].text.starts_with("bc2: filesystem 96% full"));
+
+        let not_resized = zfs_volume_issues(&zfs_volume("Ready", 2 * gib, Some((gib, 0))));
+        assert!(not_resized[0].text.contains("resize not applied"));
+    }
 
     #[test]
     fn quantities() {

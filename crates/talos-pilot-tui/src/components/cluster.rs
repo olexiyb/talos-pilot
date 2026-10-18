@@ -1218,10 +1218,10 @@ impl ClusterComponent {
         }
     }
 
-    /// LINSTOR volumes view for the selection, scoped like `workloads_action`
+    /// Volumes view for the selection, scoped like `workloads_action`
     fn volumes_action(&self) -> Action {
         match self.workloads_action() {
-            Action::ShowWorkloads(title, nodes) => Action::ShowLinstorVolumes(title, nodes),
+            Action::ShowWorkloads(title, nodes) => Action::ShowVolumes(title, nodes),
             other => other,
         }
     }

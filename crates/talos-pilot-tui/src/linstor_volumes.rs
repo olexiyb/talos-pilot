@@ -10,6 +10,8 @@
 //! - DRBD debugfs `resources/<res>/connections/<peer>/<vol>/proc_drbd`:
 //!   connection / disk state and `oos:` (KiB out of sync) per peer
 //! - DRBD debugfs `resources/<res>/connections/<peer>/debug`: `ap_in_flight`
+//! - the Mounts API on the Primary's node: size of the filesystem on the
+//!   DRBD device, which a resize must grow too
 //!
 //! debugfs is marked "format will change without notice"; anything that
 //! can't be read or parsed is reported as unknown, never as a problem.
@@ -18,7 +20,7 @@ use crate::linstor::{controller_base, get_json};
 use futures::StreamExt;
 use k8s_openapi::serde_json::Value;
 use std::collections::HashMap;
-use talos_rs::TalosClient;
+use talos_rs::{MountUsage, TalosClient};
 
 /// Volumes of the cluster's LINSTOR resources, with each replica's DRBD
 /// state as LINSTOR reports it
@@ -31,8 +33,26 @@ pub struct LinstorVolume {
     pub pvc: Option<String>,
     /// Size of the volume definition (what LINSTOR thinks it is)
     pub size_kib: Option<u64>,
+    /// Resource group, and how many diskful replicas it places
+    pub resource_group: Option<String>,
+    pub place_count: Option<u32>,
     /// One per node the resource is placed on, sorted by node
     pub replicas: Vec<Replica>,
+}
+
+impl LinstorVolume {
+    /// Replicas holding data (not diskless tie-breakers or clients)
+    pub fn diskful_replicas(&self) -> usize {
+        self.replicas.iter().filter(|r| !r.diskless).count()
+    }
+
+    /// Filesystem used and size (KiB) where the volume is mounted
+    pub fn usage_kib(&self) -> Option<(u64, u64)> {
+        self.replicas.iter().find_map(|r| {
+            let d = r.drbd.as_ref()?;
+            Some((d.fs_used_kib?, d.fs_size_kib?))
+        })
+    }
 }
 
 /// One node's replica of a volume
@@ -72,6 +92,11 @@ pub struct PeerLink {
 pub struct DrbdObserved {
     /// Device size from `/sys/block`
     pub size_kib: Option<u64>,
+    /// Size and used space of the filesystem mounted from the device
+    /// (Mounts API), only where it is mounted (the Primary) and not for raw
+    /// block volumes
+    pub fs_size_kib: Option<u64>,
+    pub fs_used_kib: Option<u64>,
     /// Per peer, from debugfs
     pub peers: HashMap<String, PeerObserved>,
 }
@@ -155,11 +180,40 @@ pub async fn fetch_volumes(client: &kube::Client) -> Result<Option<Vec<LinstorVo
     };
     let resources_path = format!("{base}/v1/view/resources");
     let definitions_path = format!("{base}/v1/resource-definitions?with_volume_definitions=true");
-    let (resources, definitions) = tokio::join!(
+    let groups_path = format!("{base}/v1/resource-groups");
+    let (resources, definitions, groups) = tokio::join!(
         get_json(client, &resources_path),
         get_json(client, &definitions_path),
+        get_json(client, &groups_path),
     );
-    Ok(Some(volumes_from(&resources?, &definitions?)))
+    let mut volumes = volumes_from(&resources?, &definitions?);
+    // Without the groups the replica count is shown without a target
+    match groups {
+        Ok(groups) => apply_place_counts(&mut volumes, &groups),
+        Err(e) => tracing::debug!("LINSTOR resource groups unavailable: {}", e),
+    }
+    Ok(Some(volumes))
+}
+
+/// Set each volume's `place_count` from its resource group's select filter
+pub fn apply_place_counts(volumes: &mut [LinstorVolume], groups: &Value) {
+    let counts: HashMap<&str, u32> = groups
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| {
+            Some((
+                g.get("name")?.as_str()?,
+                g.pointer("/select_filter/place_count")?.as_u64()? as u32,
+            ))
+        })
+        .collect();
+    for volume in volumes {
+        volume.place_count = volume
+            .resource_group
+            .as_deref()
+            .and_then(|g| counts.get(g).copied());
+    }
 }
 
 /// Group LINSTOR's resource view (one entry per resource and node) into
@@ -167,8 +221,9 @@ pub async fn fetch_volumes(client: &kube::Client) -> Result<Option<Vec<LinstorVo
 pub fn volumes_from(resources: &Value, definitions: &Value) -> Vec<LinstorVolume> {
     let str_at = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
 
-    // resource -> (pvc, volume number -> size)
-    let mut defs: HashMap<String, (Option<String>, HashMap<u64, u64>)> = HashMap::new();
+    // resource -> (pvc, resource group, volume number -> size)
+    type Definition = (Option<String>, Option<String>, HashMap<u64, u64>);
+    let mut defs: HashMap<String, Definition> = HashMap::new();
     for rd in definitions.as_array().into_iter().flatten() {
         let Some(name) = str_at(rd, "name") else {
             continue;
@@ -194,7 +249,7 @@ pub fn volumes_from(resources: &Value, definitions: &Value) -> Vec<LinstorVolume
                 ))
             })
             .collect();
-        defs.insert(name, (pvc, sizes));
+        defs.insert(name, (pvc, str_at(rd, "resource_group_name"), sizes));
     }
 
     let mut volumes: HashMap<(String, u64), LinstorVolume> = HashMap::new();
@@ -264,9 +319,11 @@ pub fn volumes_from(resources: &Value, definitions: &Value) -> Vec<LinstorVolume
                 .collect();
             peers.sort_by(|a, b| a.peer.cmp(&b.peer));
 
-            let (pvc, size_kib) = match defs.get(&name) {
-                Some((pvc, sizes)) => (pvc.clone(), sizes.get(&number).copied()),
-                None => (None, None),
+            let (pvc, resource_group, size_kib) = match defs.get(&name) {
+                Some((pvc, group, sizes)) => {
+                    (pvc.clone(), group.clone(), sizes.get(&number).copied())
+                }
+                None => (None, None, None),
             };
             let volume = volumes
                 .entry((name.clone(), number))
@@ -275,6 +332,8 @@ pub fn volumes_from(resources: &Value, definitions: &Value) -> Vec<LinstorVolume
                     volume_number: number as u32,
                     pvc,
                     size_kib,
+                    resource_group,
+                    place_count: None,
                     replicas: Vec::new(),
                 });
             volume.replicas.push(Replica {
@@ -363,7 +422,7 @@ pub async fn observe_drbd(
         }
     }
 
-    let results: Vec<_> = futures::stream::iter(probes)
+    let reads = futures::stream::iter(probes)
         .map(|(at, probe, client, path)| async move {
             let content = tokio::time::timeout(READ_TIMEOUT, client.read_file(&path))
                 .await
@@ -372,8 +431,8 @@ pub async fn observe_drbd(
             (at, probe, content)
         })
         .buffer_unordered(OBSERVE_CONCURRENCY)
-        .collect()
-        .await;
+        .collect::<Vec<_>>();
+    let results = reads.await;
 
     for ((vi, ri), probe, content) in results {
         let Some(content) = content else {
@@ -398,6 +457,90 @@ pub async fn observe_drbd(
     }
 }
 
+/// Mounted filesystems per node name, one Mounts call per node, each
+/// bounded. A node whose call fails is left out.
+pub async fn fetch_mounts(
+    talos: &TalosClient,
+    node_ips: &HashMap<String, String>,
+    nodes: &[String],
+) -> HashMap<String, Vec<MountUsage>> {
+    let calls = nodes.iter().filter_map(|node| {
+        let client = talos.with_node(node_ips.get(node)?);
+        Some(async move {
+            let mounts = tokio::time::timeout(READ_TIMEOUT, client.mounts())
+                .await
+                .ok()?
+                .ok()?;
+            Some((
+                node.clone(),
+                mounts.into_iter().flat_map(|m| m.mounts).collect(),
+            ))
+        })
+    });
+    futures::future::join_all(calls)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Nodes whose mounts the LINSTOR volumes need: where they are in use
+pub fn linstor_mount_nodes(volumes: &[LinstorVolume]) -> Vec<String> {
+    volumes
+        .iter()
+        .flat_map(|v| &v.replicas)
+        .filter(|r| r.in_use && r.drbd_layer)
+        .map(|r| r.node.clone())
+        .collect()
+}
+
+/// Set the filesystem size and usage of each in-use replica from the mount
+/// of its DRBD device. A device mounted several times (pod mount, subPaths)
+/// has the same size everywhere.
+pub fn apply_mounts(volumes: &mut [LinstorVolume], mounts: &HashMap<String, Vec<MountUsage>>) {
+    for volume in volumes {
+        for replica in volume.replicas.iter_mut().filter(|r| r.in_use) {
+            let (Some(minor), Some(node_mounts)) = (replica.minor, mounts.get(&replica.node))
+            else {
+                continue;
+            };
+            let device = format!("/dev/drbd{minor}");
+            if let Some(m) = node_mounts.iter().find(|m| m.filesystem == device) {
+                let observed = replica.drbd.get_or_insert_with(DrbdObserved::default);
+                observed.fs_size_kib = Some(m.size / 1024);
+                observed.fs_used_kib = Some(m.size.saturating_sub(m.available) / 1024);
+            }
+        }
+    }
+}
+
+/// Filesystem fill levels that are a warning / an error (percent)
+const USAGE_WARNING_PCT: f64 = 85.0;
+const USAGE_ERROR_PCT: f64 = 95.0;
+
+/// An issue for a filesystem filling up on `node`
+pub fn usage_issue(node: &str, used_kib: u64, size_kib: u64) -> Option<Issue> {
+    if size_kib == 0 {
+        return None;
+    }
+    let pct = used_kib as f64 / size_kib as f64 * 100.0;
+    let severity = if pct >= USAGE_ERROR_PCT {
+        Severity::Error
+    } else if pct >= USAGE_WARNING_PCT {
+        Severity::Warning
+    } else {
+        return None;
+    };
+    Some(Issue {
+        severity,
+        text: format!(
+            "{node}: filesystem {pct:.0}% full ({} of {})",
+            format_kib(used_kib),
+            format_kib(size_kib)
+        ),
+    })
+}
+
 /// `cs:` and `oos:` from a debugfs `proc_drbd` file, e.g.
 /// `1015: cs:Established ro:Secondary/Secondary ds:UpToDate/UpToDate C r-----`
 /// followed by `ns:0 nr:0 … oos:0`
@@ -420,6 +563,13 @@ fn parse_ap_in_flight(content: &str) -> Option<u64> {
     })
 }
 
+/// Filesystem overhead allowed before a filesystem counts as not grown to
+/// its device: fixed (journal/log, superblocks) plus proportional (inode
+/// tables, allocation groups). Healthy volumes measured on three clusters
+/// lose up to 187 MiB of 1 GiB and 64 MiB of 300 MiB.
+const FS_OVERHEAD_FIXED_KIB: u64 = 160 * 1024;
+const FS_OVERHEAD_PERCENT: u64 = 8;
+
 /// In-flight writes beyond this are a wrapped-around (underflowed) counter
 const AP_IN_FLIGHT_IMPLAUSIBLE_KIB: u64 = 1 << 40;
 
@@ -439,6 +589,22 @@ pub fn volume_issues(volume: &LinstorVolume) -> Vec<Issue> {
                 .is_some_and(|s| s.starts_with("Sync") || s.starts_with("PausedSync"))
         })
     };
+
+    if let Some(wanted) = volume.place_count {
+        let have = volume.diskful_replicas();
+        if have < wanted as usize {
+            push(
+                Severity::Error,
+                format!("only {have} of {wanted} replicas hold data"),
+            );
+        }
+    }
+    if let Some(node) = volume.replicas.iter().find(|r| r.in_use).map(|r| &r.node)
+        && let Some((used, size)) = volume.usage_kib()
+        && let Some(issue) = usage_issue(node, used, size)
+    {
+        push(issue.severity, issue.text);
+    }
 
     for r in &volume.replicas {
         if !r.drbd_layer {
@@ -489,6 +655,22 @@ pub fn volume_issues(volume: &LinstorVolume) -> Vec<Issue> {
                     r.node,
                     format_kib(actual),
                     format_kib(expected)
+                ),
+            );
+        }
+        // A resize must also grow the filesystem (the 2026-10-17 incident's
+        // XFS stayed at 5.9 GiB on an 11 GiB device); briefly smaller while
+        // a resize runs, hence a warning
+        if let (Some(fs), Some(device)) = (observed.fs_size_kib, observed.size_kib)
+            && fs + FS_OVERHEAD_FIXED_KIB + device * FS_OVERHEAD_PERCENT / 100 < device
+        {
+            push(
+                Severity::Warning,
+                format!(
+                    "{}: filesystem {} on a {} DRBD device: not grown after a resize",
+                    r.node,
+                    format_kib(fs),
+                    format_kib(device)
                 ),
             );
         }
@@ -780,6 +962,8 @@ mod tests {
         let mut volume = volumes_from(&resources, &definitions()).remove(0);
         assert!(volume_issues(&volume).is_empty());
         volume.replicas[0].drbd = Some(DrbdObserved {
+            fs_size_kib: None,
+            fs_used_kib: None,
             size_kib: Some(6 * 1024 * 1024),
             peers: HashMap::new(),
         });
@@ -787,6 +971,66 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].severity, Severity::Error);
         assert!(issues[0].text.starts_with("bc1: DRBD device"));
+    }
+
+    #[test]
+    fn missing_replica_and_full_filesystem_are_issues() {
+        let resources = json!([
+            resource("bc1", true, "UpToDate", &[("bc2", true, "Established")]),
+            resource("bc2", false, "UpToDate", &[("bc1", true, "Established")]),
+        ]);
+        let mut volume = volumes_from(&resources, &definitions()).remove(0);
+        let groups = json!([{"name": "sc-1", "select_filter": {"place_count": 3}}]);
+        volume.resource_group = Some("sc-1".to_string());
+        apply_place_counts(std::slice::from_mut(&mut volume), &groups);
+        assert_eq!(volume.place_count, Some(3));
+        let issues = volume_issues(&volume);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].text, "only 2 of 3 replicas hold data");
+
+        volume.place_count = Some(2);
+        let gib = 1024 * 1024;
+        volume.replicas[0].drbd = Some(DrbdObserved {
+            size_kib: Some(11 * gib + 8),
+            fs_size_kib: Some(10 * gib),
+            fs_used_kib: Some(9 * gib),
+            peers: HashMap::new(),
+        });
+        let issues = volume_issues(&volume);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Warning);
+        assert!(issues[0].text.starts_with("bc1: filesystem 90% full"));
+        assert_eq!(volume.usage_kib(), Some((9 * gib, 10 * gib)));
+    }
+
+    #[test]
+    fn filesystem_not_grown_is_a_warning() {
+        let resources = json!([resource("bc1", true, "UpToDate", &[])]);
+        let mut volume = volumes_from(&resources, &definitions()).remove(0);
+        let gib = 1024 * 1024;
+        let with_fs = |fs: u64, device: u64| DrbdObserved {
+            fs_size_kib: Some(fs),
+            fs_used_kib: None,
+            size_kib: Some(device),
+            peers: HashMap::new(),
+        };
+        // Healthy overheads measured on real volumes
+        for (fs, device) in [
+            (856_678, gib),         // 836.6 MiB on 1 GiB
+            (241_664, 300 * 1024),  // 236 MiB on 300 MiB
+            (10_380_902, 10 * gib), // 9.9 GiB on 10 GiB
+        ] {
+            volume.size_kib = Some(device);
+            volume.replicas[0].drbd = Some(with_fs(fs, device));
+            assert!(volume_issues(&volume).is_empty(), "{fs} on {device}");
+        }
+        // The incident: XFS at 5.9 GiB on the grown 11 GiB device
+        volume.size_kib = Some(11 * gib);
+        volume.replicas[0].drbd = Some(with_fs(6_186_598, 11 * gib + 8));
+        let issues = volume_issues(&volume);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Warning);
+        assert!(issues[0].text.contains("not grown"));
     }
 
     #[test]
@@ -799,6 +1043,8 @@ mod tests {
         )]);
         let mut volume = volumes_from(&resources, &definitions()).remove(0);
         let observed = |oos, ap| DrbdObserved {
+            fs_size_kib: None,
+            fs_used_kib: None,
             size_kib: Some(11 * 1024 * 1024 + 8),
             peers: HashMap::from([(
                 "bc2".to_string(),
@@ -832,6 +1078,8 @@ mod tests {
         ]);
         let mut volume = volumes_from(&resources, &definitions()).remove(0);
         let seen = |oos: &[(&str, u64)]| DrbdObserved {
+            fs_size_kib: None,
+            fs_used_kib: None,
             size_kib: Some(11 * 1024 * 1024 + 8),
             peers: oos
                 .iter()
@@ -965,6 +1213,59 @@ mod tests {
         let mut volumes = fetch_volumes(&kube).await.unwrap().expect("no LINSTOR");
         let fetched = started.elapsed();
         observe_drbd(&talos, &node_ips, &mut volumes).await;
+        let mut zfs = crate::zfs::fetch_zfs_volumes(&kube)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        let mut mount_nodes = linstor_mount_nodes(&volumes);
+        mount_nodes.extend(zfs.iter().map(|z| z.node.clone()));
+        mount_nodes.sort();
+        mount_nodes.dedup();
+        let mounts = fetch_mounts(&talos, &node_ips, &mount_nodes).await;
+        apply_mounts(&mut volumes, &mounts);
+        crate::zfs::apply_zfs_mounts(&mut zfs, &mounts);
+        let place: Vec<String> = volumes
+            .iter()
+            .map(|v| format!("{}/{:?}", v.diskful_replicas(), v.place_count))
+            .collect();
+        let mut place_summary: HashMap<&String, usize> = HashMap::new();
+        for p in &place {
+            *place_summary.entry(p).or_default() += 1;
+        }
+        println!("replicas/place_count: {place_summary:?}");
+        let used: Vec<f64> = volumes
+            .iter()
+            .filter_map(|v| v.usage_kib())
+            .map(|(u, s)| u as f64 / s as f64 * 100.0)
+            .collect();
+        println!(
+            "LINSTOR usage known for {}, max {:.0}%",
+            used.len(),
+            used.iter().cloned().fold(0.0, f64::max)
+        );
+        let mounted: Vec<&crate::zfs::ZfsVolume> = zfs.iter().filter(|z| z.fs.is_some()).collect();
+        let ratio =
+            |z: &crate::zfs::ZfsVolume| z.fs.unwrap().0 as f64 / z.capacity.unwrap_or(1) as f64;
+        let (rmin, rmax) = mounted
+            .iter()
+            .map(|z| ratio(z))
+            .fold((f64::MAX, 0.0f64), |(a, b), r| (a.min(r), b.max(r)));
+        println!(
+            "{} ZFS volumes, {} mounted, mount/capacity ratio {rmin:.3}..{rmax:.3}, states {:?}",
+            zfs.len(),
+            mounted.len(),
+            zfs.iter()
+                .map(|z| z.state.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        for z in &zfs {
+            for issue in crate::zfs::zfs_volume_issues(z) {
+                println!(
+                    "ZFS {:?} {} {:?}: {}",
+                    issue.severity, z.name, z.pvc, issue.text
+                );
+            }
+        }
         let replicas: usize = volumes.iter().map(|v| v.replicas.len()).sum();
         let observed = volumes
             .iter()

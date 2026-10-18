@@ -6,8 +6,8 @@ use crate::components::rolling_operations::RollingNodeInfo;
 use crate::components::wizard::{WizardComponent, WizardState};
 use crate::components::{
     ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent,
-    LinstorVolumesComponent, MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent,
-    ProcessesComponent, RollingOperationsComponent, SecurityComponent, StorageComponent,
+    MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent,
+    RollingOperationsComponent, SecurityComponent, StorageComponent, VolumesComponent,
     WorkloadHealthComponent,
 };
 use crate::tui::{self, Tui};
@@ -28,7 +28,7 @@ enum RefreshJob {
     Storage(JoinHandle<StorageComponent>),
     Processes(JoinHandle<ProcessesComponent>),
     Etcd(JoinHandle<EtcdComponent>),
-    Volumes(JoinHandle<LinstorVolumesComponent>),
+    Volumes(JoinHandle<VolumesComponent>),
 }
 
 impl RefreshJob {
@@ -115,7 +115,7 @@ pub struct App {
     /// Log levels last shown in the logs view, restored when it is reopened
     log_level_filter: crate::components::multi_logs::LevelFilter,
     /// Volumes view toggle, filter and selection, kept across visits
-    volumes_view_state: Option<crate::components::linstor_volumes::VolumesViewState>,
+    volumes_view_state: Option<crate::components::volumes::VolumesViewState>,
     /// Etcd status component (created when viewing etcd)
     etcd: Option<EtcdComponent>,
     /// Processes component (created when viewing processes)
@@ -130,8 +130,8 @@ pub struct App {
     lifecycle: Option<LifecycleComponent>,
     /// Workload health component (created when viewing workloads)
     workloads: Option<WorkloadHealthComponent>,
-    /// LINSTOR volumes component (created when viewing volumes)
-    volumes: Option<LinstorVolumesComponent>,
+    /// Volumes component (created when viewing volumes)
+    volumes: Option<VolumesComponent>,
     /// Storage component (created when viewing disks/volumes)
     storage: Option<StorageComponent>,
     /// Node operations component (overlay for node operations)
@@ -1410,11 +1410,11 @@ impl App {
                 self.workloads = Some(workloads);
                 self.view = View::Workloads;
             }
-            Action::ShowLinstorVolumes(title, nodes) => {
+            Action::ShowVolumes(title, nodes) => {
                 self.cancel_refresh_job();
-                tracing::info!("ShowLinstorVolumes: '{}'", title);
+                tracing::info!("ShowVolumes: '{}'", title);
 
-                let mut volumes = LinstorVolumesComponent::new(title, nodes);
+                let mut volumes = VolumesComponent::new(title, nodes);
                 if let Some(state) = self.volumes_view_state.clone() {
                     volumes.set_view_state(state);
                 }
