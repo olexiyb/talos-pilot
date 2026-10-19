@@ -36,6 +36,8 @@ pub struct LinstorVolume {
     /// Resource group, and how many diskful replicas it places
     pub resource_group: Option<String>,
     pub place_count: Option<u32>,
+    /// The definition is being deleted (`DELETE` flag)
+    pub deleting: bool,
     /// One per node the resource is placed on, sorted by node
     pub replicas: Vec<Replica>,
 }
@@ -97,6 +99,10 @@ pub struct DrbdObserved {
     /// block volumes
     pub fs_size_kib: Option<u64>,
     pub fs_used_kib: Option<u64>,
+    /// I/O frozen on the device (the `s` flag in debugfs `proc_drbd`):
+    /// quorum lost with `on-no-quorum suspend-io`, fencing, or by hand.
+    /// Writes of the app using it hang until it resumes.
+    pub io_suspended: Option<bool>,
     /// Per peer, from debugfs
     pub peers: HashMap<String, PeerObserved>,
 }
@@ -221,8 +227,8 @@ pub fn apply_place_counts(volumes: &mut [LinstorVolume], groups: &Value) {
 pub fn volumes_from(resources: &Value, definitions: &Value) -> Vec<LinstorVolume> {
     let str_at = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
 
-    // resource -> (pvc, resource group, volume number -> size)
-    type Definition = (Option<String>, Option<String>, HashMap<u64, u64>);
+    // resource -> (pvc, resource group, deleting, volume number -> size)
+    type Definition = (Option<String>, Option<String>, bool, HashMap<u64, u64>);
     let mut defs: HashMap<String, Definition> = HashMap::new();
     for rd in definitions.as_array().into_iter().flatten() {
         let Some(name) = str_at(rd, "name") else {
@@ -249,7 +255,14 @@ pub fn volumes_from(resources: &Value, definitions: &Value) -> Vec<LinstorVolume
                 ))
             })
             .collect();
-        defs.insert(name, (pvc, str_at(rd, "resource_group_name"), sizes));
+        let deleting = rd
+            .get("flags")
+            .and_then(Value::as_array)
+            .is_some_and(|flags| flags.iter().any(|f| f.as_str() == Some("DELETE")));
+        defs.insert(
+            name,
+            (pvc, str_at(rd, "resource_group_name"), deleting, sizes),
+        );
     }
 
     let mut volumes: HashMap<(String, u64), LinstorVolume> = HashMap::new();
@@ -319,11 +332,14 @@ pub fn volumes_from(resources: &Value, definitions: &Value) -> Vec<LinstorVolume
                 .collect();
             peers.sort_by(|a, b| a.peer.cmp(&b.peer));
 
-            let (pvc, resource_group, size_kib) = match defs.get(&name) {
-                Some((pvc, group, sizes)) => {
-                    (pvc.clone(), group.clone(), sizes.get(&number).copied())
-                }
-                None => (None, None, None),
+            let (pvc, resource_group, deleting, size_kib) = match defs.get(&name) {
+                Some((pvc, group, deleting, sizes)) => (
+                    pvc.clone(),
+                    group.clone(),
+                    *deleting,
+                    sizes.get(&number).copied(),
+                ),
+                None => (None, None, false, None),
             };
             let volume = volumes
                 .entry((name.clone(), number))
@@ -334,6 +350,7 @@ pub fn volumes_from(resources: &Value, definitions: &Value) -> Vec<LinstorVolume
                     size_kib,
                     resource_group,
                     place_count: None,
+                    deleting,
                     replicas: Vec::new(),
                 });
             volume.replicas.push(Replica {
@@ -444,10 +461,14 @@ pub async fn observe_drbd(
             // 512-byte sectors
             Probe::Size => observed.size_kib = content.trim().parse::<u64>().ok().map(|s| s / 2),
             Probe::PeerDevice(peer) => {
-                let (cs, oos_kib) = parse_proc_drbd(&content);
+                let parsed = parse_proc_drbd(&content);
+                // Per device; every peer's file reports the same
+                if let Some(suspended) = parsed.suspended {
+                    observed.io_suspended = Some(observed.io_suspended == Some(true) || suspended);
+                }
                 let entry = observed.peers.entry(peer).or_default();
-                entry.cs = cs;
-                entry.oos_kib = oos_kib;
+                entry.cs = parsed.cs;
+                entry.oos_kib = parsed.oos_kib;
             }
             Probe::PeerConnection(peer) => {
                 observed.peers.entry(peer).or_default().ap_in_flight_kib =
@@ -541,17 +562,42 @@ pub fn usage_issue(node: &str, used_kib: u64, size_kib: u64) -> Option<Issue> {
     })
 }
 
-/// `cs:` and `oos:` from a debugfs `proc_drbd` file, e.g.
+/// What a debugfs `proc_drbd` file says about a peer device
+#[derive(Debug, PartialEq, Default)]
+struct ProcDrbd {
+    cs: Option<String>,
+    oos_kib: Option<u64>,
+    /// First of the state flags: `s` suspended, `r` running
+    suspended: Option<bool>,
+}
+
+/// `cs:`, `oos:` and the suspended flag from a debugfs `proc_drbd` file, e.g.
 /// `1015: cs:Established ro:Secondary/Secondary ds:UpToDate/UpToDate C r-----`
 /// followed by `ns:0 nr:0 … oos:0`
-fn parse_proc_drbd(content: &str) -> (Option<String>, Option<u64>) {
+fn parse_proc_drbd(content: &str) -> ProcDrbd {
     let field = |key: &str| {
         content
             .split_whitespace()
             .find_map(|t| t.strip_prefix(key))
             .map(str::to_string)
     };
-    (field("cs:"), field("oos:").and_then(|v| v.parse().ok()))
+    // The flags are the last word of the first line, six characters
+    let suspended = content
+        .lines()
+        .next()
+        .filter(|l| l.contains("cs:"))
+        .and_then(|l| l.split_whitespace().last())
+        .filter(|f| f.len() == 6)
+        .and_then(|f| match f.as_bytes()[0] {
+            b's' => Some(true),
+            b'r' => Some(false),
+            _ => None,
+        });
+    ProcDrbd {
+        cs: field("cs:"),
+        oos_kib: field("oos:").and_then(|v| v.parse().ok()),
+        suspended,
+    }
 }
 
 /// `ap_in_flight` in KiB from a debugfs connection `debug` file
@@ -645,6 +691,15 @@ pub fn volume_issues(volume: &LinstorVolume) -> Vec<Issue> {
         let Some(observed) = &r.drbd else {
             continue;
         };
+        if observed.io_suspended == Some(true) {
+            push(
+                Severity::Error,
+                format!(
+                    "{}: I/O suspended (quorum lost, fencing or by hand): writes hang",
+                    r.node
+                ),
+            );
+        }
         if let (Some(actual), Some(expected)) = (observed.size_kib, volume.size_kib)
             && actual < expected
         {
@@ -964,6 +1019,7 @@ mod tests {
         volume.replicas[0].drbd = Some(DrbdObserved {
             fs_size_kib: None,
             fs_used_kib: None,
+            io_suspended: None,
             size_kib: Some(6 * 1024 * 1024),
             peers: HashMap::new(),
         });
@@ -994,6 +1050,7 @@ mod tests {
             size_kib: Some(11 * gib + 8),
             fs_size_kib: Some(10 * gib),
             fs_used_kib: Some(9 * gib),
+            io_suspended: None,
             peers: HashMap::new(),
         });
         let issues = volume_issues(&volume);
@@ -1004,6 +1061,25 @@ mod tests {
     }
 
     #[test]
+    fn suspended_io_is_an_error() {
+        let resources = json!([
+            resource("bc1", true, "UpToDate", &[("bc2", true, "Established")]),
+            resource("bc2", false, "UpToDate", &[("bc1", true, "Established")]),
+        ]);
+        let mut volume = volumes_from(&resources, &definitions()).remove(0);
+        volume.replicas[0].drbd = Some(DrbdObserved {
+            io_suspended: Some(false),
+            ..Default::default()
+        });
+        assert!(volume_issues(&volume).is_empty());
+        volume.replicas[0].drbd.as_mut().unwrap().io_suspended = Some(true);
+        let issues = volume_issues(&volume);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(issues[0].text.starts_with("bc1: I/O suspended"));
+    }
+
+    #[test]
     fn filesystem_not_grown_is_a_warning() {
         let resources = json!([resource("bc1", true, "UpToDate", &[])]);
         let mut volume = volumes_from(&resources, &definitions()).remove(0);
@@ -1011,6 +1087,7 @@ mod tests {
         let with_fs = |fs: u64, device: u64| DrbdObserved {
             fs_size_kib: Some(fs),
             fs_used_kib: None,
+            io_suspended: None,
             size_kib: Some(device),
             peers: HashMap::new(),
         };
@@ -1045,6 +1122,7 @@ mod tests {
         let observed = |oos, ap| DrbdObserved {
             fs_size_kib: None,
             fs_used_kib: None,
+            io_suspended: None,
             size_kib: Some(11 * 1024 * 1024 + 8),
             peers: HashMap::from([(
                 "bc2".to_string(),
@@ -1080,6 +1158,7 @@ mod tests {
         let seen = |oos: &[(&str, u64)]| DrbdObserved {
             fs_size_kib: None,
             fs_used_kib: None,
+            io_suspended: None,
             size_kib: Some(11 * 1024 * 1024 + 8),
             peers: oos
                 .iter()
@@ -1165,9 +1244,15 @@ mod tests {
         let proc_drbd = "1015: cs:Established ro:Secondary/Secondary ds:UpToDate/UpToDate C r-----\n    ns:0 nr:0 dw:0 dr:7168 al:0 bm:2 lo:1 pe:[0;0] ua:0 ap:[0;0] ep:1 wo:2 oos:12\n";
         assert_eq!(
             parse_proc_drbd(proc_drbd),
-            (Some("Established".to_string()), Some(12))
+            ProcDrbd {
+                cs: Some("Established".to_string()),
+                oos_kib: Some(12),
+                suspended: Some(false),
+            }
         );
-        assert_eq!(parse_proc_drbd("garbage"), (None, None));
+        let frozen = proc_drbd.replace("C r-----", "C s----Q");
+        assert_eq!(parse_proc_drbd(&frozen).suspended, Some(true));
+        assert_eq!(parse_proc_drbd("garbage"), ProcDrbd::default());
 
         let debug = "flags: 0x180800 : RECONNECT\n            ap_in_flight: 16 KiB (32 sectors)\n            rs_in_flight: 0 KiB (0 sectors)\n";
         assert_eq!(parse_ap_in_flight(debug), Some(16));
@@ -1224,6 +1309,17 @@ mod tests {
         let mounts = fetch_mounts(&talos, &node_ips, &mount_nodes).await;
         apply_mounts(&mut volumes, &mounts);
         crate::zfs::apply_zfs_mounts(&mut zfs, &mounts);
+        let pvs = crate::orphans::fetch_pv_index(&kube).await.unwrap();
+        for v in volumes.iter().filter(|v| v.pvc.is_some()) {
+            if let Some(o) = pvs.orphan(&v.resource) {
+                println!("orphan LINSTOR {} ({:?}): {o:?}", v.resource, v.pvc);
+            }
+        }
+        for v in &zfs {
+            if let Some(o) = pvs.orphan(&v.name) {
+                println!("orphan ZFS {} on {}: {o:?}", v.name, v.node);
+            }
+        }
         let place: Vec<String> = volumes
             .iter()
             .map(|v| format!("{}/{:?}", v.diskful_replicas(), v.place_count))

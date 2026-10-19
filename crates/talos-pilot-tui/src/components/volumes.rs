@@ -10,7 +10,8 @@
 //! - OpenEBS ZFS LocalPV volumes (see `crate::zfs`): one dataset on one node
 //!
 //! For both, the filesystem's size and fill level come from the Talos Mounts
-//! API on the node where the volume is mounted. Like the workloads view it
+//! API on the node where the volume is mounted, and a volume no PV uses any
+//! more is flagged as orphaned (see `crate::orphans`). Like the workloads view it
 //! can be scoped to the selected node(s).
 
 use crate::action::Action;
@@ -20,6 +21,7 @@ use crate::linstor_volumes::{
     fetch_satellites, fetch_volumes, format_kib, linstor_mount_nodes, observe_drbd, remediation,
     volume_issues,
 };
+use crate::orphans::{Orphan, PvIndex, fetch_pv_index};
 use crate::zfs::{ZfsVolume, apply_zfs_mounts, fetch_zfs_volumes, zfs_volume_issues};
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -50,7 +52,38 @@ enum Source {
 #[derive(Debug, Clone)]
 struct VolumeRow {
     source: Source,
+    /// Set when no PV uses the volume any more
+    orphan: Option<Orphan>,
     issues: Vec<Issue>,
+}
+
+impl VolumeRow {
+    /// A row with the issues of its source and of being orphaned
+    fn new(source: Source, pvs: Option<&PvIndex>) -> Self {
+        let (mut issues, orphan) = match &source {
+            // Only volumes the CSI driver made (with PVC properties) belong
+            // to a PV; others were made by hand for something else. One
+            // being deleted outlives its PV until the driver is done.
+            Source::Linstor(v) => (
+                volume_issues(v),
+                pvs.filter(|_| v.pvc.is_some() && !v.deleting)
+                    .and_then(|p| p.orphan(&v.resource)),
+            ),
+            Source::Zfs(v) => (
+                zfs_volume_issues(v),
+                pvs.filter(|_| !v.deleting).and_then(|p| p.orphan(&v.name)),
+            ),
+        };
+        if let Some(orphan) = &orphan {
+            issues.push(orphan.issue());
+            issues.sort_by_key(|i| i.severity);
+        }
+        VolumeRow {
+            source,
+            orphan,
+            issues,
+        }
+    }
 }
 
 impl VolumeRow {
@@ -116,6 +149,57 @@ impl VolumeRow {
             Source::Zfs(v) => vec![v.node.as_str()],
         }
     }
+}
+
+/// Deleting an orphaned volume: its PV first, if it still has one, then the
+/// volume itself, which destroys the data
+fn orphan_remedy(
+    row: &VolumeRow,
+    orphan: &Orphan,
+    satellites: &HashMap<String, SatellitePod>,
+) -> Remedy {
+    let mut commands: Vec<String> = orphan
+        .pv()
+        .map(|pv| format!("kubectl delete pv {pv}"))
+        .into_iter()
+        .collect();
+    let size = row
+        .size_kib()
+        .map(format_kib)
+        .unwrap_or_else(|| "its data".to_string());
+    let summary = match &row.source {
+        Source::Linstor(v) => {
+            // The controller runs where the satellites do
+            let namespace = satellites
+                .values()
+                .next()
+                .map_or("piraeus-datastore", |p| p.namespace.as_str());
+            commands.push(format!(
+                "kubectl -n {namespace} exec deploy/linstor-controller -- \
+                 linstor resource-definition delete {}",
+                v.resource
+            ));
+            format!(
+                "Delete orphaned {} and its {} replica(s): destroys {size} for good. \
+                 Make sure nothing needs it first.",
+                v.resource,
+                v.replicas.len()
+            )
+        }
+        Source::Zfs(v) => {
+            commands.push(format!(
+                "kubectl -n {} delete zfsvolume {}",
+                v.namespace, v.name
+            ));
+            format!(
+                "Delete orphaned dataset {} on {}: destroys {size} for good. \
+                 Make sure nothing needs it first.",
+                v.dataset(),
+                v.node
+            )
+        }
+    };
+    Remedy { summary, commands }
 }
 
 /// Which kind of volume the list shows
@@ -307,13 +391,26 @@ impl VolumesComponent {
 
         // All bounded: kube's own read timeout is minutes, so a dead API
         // connection would otherwise hold the scan that long
-        let (linstor, zfs, satellites) = tokio::join!(
+        let (linstor, zfs, satellites, pvs) = tokio::join!(
             tokio::time::timeout(Duration::from_secs(20), fetch_volumes(client)),
             tokio::time::timeout(Duration::from_secs(20), fetch_zfs_volumes(client)),
             tokio::time::timeout(Duration::from_secs(10), fetch_satellites(client)),
+            tokio::time::timeout(Duration::from_secs(20), fetch_pv_index(client)),
         );
         let satellites = satellites.unwrap_or_default();
         let mut source_errors = Vec::new();
+        // Without PVs nothing is flagged as orphaned
+        let pvs = match pvs {
+            Ok(Ok(pvs)) => Some(pvs),
+            Ok(Err(e)) => {
+                source_errors.push(format!("PersistentVolumes (orphan check): {e}"));
+                None
+            }
+            Err(_) => {
+                source_errors.push("PersistentVolumes (orphan check): timed out".to_string());
+                None
+            }
+        };
         let linstor = match linstor {
             Ok(Ok(volumes)) => volumes,
             Ok(Err(e)) => {
@@ -348,6 +445,11 @@ impl VolumesComponent {
         }
         let mut linstor = linstor.unwrap_or_default();
         let mut zfs = zfs.unwrap_or_default();
+        if let Some(pvs) = &pvs {
+            for v in &mut zfs {
+                v.pvc = pvs.claim(&v.name);
+            }
+        }
 
         let in_scope = |node: &str| self.scope.as_ref().is_none_or(|s| s.contains(node));
         if self.scope.is_some() {
@@ -395,14 +497,9 @@ impl VolumesComponent {
 
         let mut rows: Vec<VolumeRow> = linstor
             .into_iter()
-            .map(|v| VolumeRow {
-                issues: volume_issues(&v),
-                source: Source::Linstor(v),
-            })
-            .chain(zfs.into_iter().map(|v| VolumeRow {
-                issues: zfs_volume_issues(&v),
-                source: Source::Zfs(v),
-            }))
+            .map(Source::Linstor)
+            .chain(zfs.into_iter().map(Source::Zfs))
+            .map(|source| VolumeRow::new(source, pvs.as_ref()))
             .collect();
         // Worst first; `None` (healthy) sorts after both severities
         rows.sort_by(|a, b| {
@@ -687,10 +784,14 @@ impl VolumesComponent {
         let (Some(data), Some(row)) = (self.state.data(), visible.get(self.selected)) else {
             return Vec::new();
         };
-        match &row.source {
+        let mut remedies = match &row.source {
             Source::Linstor(v) => remediation(v, &data.satellites),
             Source::Zfs(_) => Vec::new(),
+        };
+        if let Some(orphan) = &row.orphan {
+            remedies.push(orphan_remedy(row, orphan, &data.satellites));
         }
+        remedies
     }
 
     /// Copy the selected volume's fix commands, each step preceded by its
@@ -1094,6 +1195,7 @@ mod tests {
                 size_kib: Some(11 * 1024 * 1024),
                 fs_size_kib: in_use.then_some(10 * 1024 * 1024),
                 fs_used_kib: in_use.then_some(5 * 1024 * 1024),
+                io_suspended: None,
                 peers: peers
                     .iter()
                     .map(|p| {
@@ -1119,6 +1221,7 @@ mod tests {
             size_kib: Some(11 * 1024 * 1024),
             resource_group: None,
             place_count: Some(3),
+            deleting: false,
             replicas: vec![
                 replica("bc1", true, &["bc2", "bc4"], oos),
                 replica("bc2", false, &["bc1", "bc4"], 0),
@@ -1128,6 +1231,7 @@ mod tests {
         let gib = 1u64 << 30;
         let zfs = ZfsVolume {
             name: "pvc-mongo".to_string(),
+            namespace: "openebs".to_string(),
             pvc: Some("db/data-mongo-0".to_string()),
             node: "bc2".to_string(),
             pool: "datapool/localpv".to_string(),
@@ -1135,18 +1239,13 @@ mod tests {
             state: "Ready".to_string(),
             volume_type: "DATASET".to_string(),
             fs: Some((10 * gib, 9 * gib + gib / 2)),
+            deleting: false,
         };
         let mut rows: Vec<VolumeRow> = [linstor("vmsingle", 924), linstor("grafana", 0)]
             .into_iter()
-            .map(|v| VolumeRow {
-                issues: volume_issues(&v),
-                source: Source::Linstor(v),
-            })
+            .map(|v| VolumeRow::new(Source::Linstor(v), None))
             .collect();
-        rows.push(VolumeRow {
-            issues: zfs_volume_issues(&zfs),
-            source: Source::Zfs(zfs),
-        });
+        rows.push(VolumeRow::new(Source::Zfs(zfs), None));
         let mut c = VolumesComponent::new("bc".to_string(), None);
         c.state.set_data(VolumesData {
             installed: true,
@@ -1224,6 +1323,62 @@ mod tests {
         assert!(zfs_only.contains("db/data-mongo-0"));
         assert!(!zfs_only.contains("monitoring/vmsingle"));
         assert!(zfs_only.contains("local dataset, not replicated"));
+    }
+
+    #[test]
+    fn orphaned_volume_is_flagged_with_its_delete_commands() {
+        let pvs = PvIndex::default();
+        let zfs = ZfsVolume {
+            name: "pvc-gone".to_string(),
+            namespace: "openebs".to_string(),
+            node: "bc2".to_string(),
+            pool: "datapool/localpv".to_string(),
+            capacity: Some(1 << 30),
+            state: "Ready".to_string(),
+            ..Default::default()
+        };
+        let row = VolumeRow::new(Source::Zfs(zfs), Some(&pvs));
+        assert_eq!(row.orphan, Some(Orphan::NoPv));
+        assert_eq!(row.issues.len(), 1);
+        let remedy = orphan_remedy(&row, &Orphan::NoPv, &HashMap::new());
+        assert_eq!(
+            remedy.commands,
+            ["kubectl -n openebs delete zfsvolume pvc-gone"]
+        );
+        assert!(remedy.summary.contains("datapool/localpv/pvc-gone on bc2"));
+
+        // A LINSTOR volume the CSI driver didn't make is never an orphan
+        let csi = LinstorVolume {
+            resource: "pvc-grafana".to_string(),
+            pvc: Some("mon/grafana".to_string()),
+            replicas: vec![replica("bc1", true, &["bc2"], 0)],
+            ..Default::default()
+        };
+        let mut handmade = csi.clone();
+        handmade.pvc = None;
+        assert_eq!(
+            VolumeRow::new(Source::Linstor(handmade), Some(&pvs)).orphan,
+            None
+        );
+        // Nor is one being deleted, after its PV is gone
+        let mut deleting = csi.clone();
+        deleting.deleting = true;
+        assert_eq!(
+            VolumeRow::new(Source::Linstor(deleting), Some(&pvs)).orphan,
+            None
+        );
+
+        let released = Orphan::Released {
+            pv: "pvc-old".to_string(),
+            claim: Some("mon/grafana".to_string()),
+        };
+        let row = VolumeRow::new(Source::Linstor(csi), None);
+        let remedy = orphan_remedy(&row, &released, &HashMap::new());
+        assert_eq!(remedy.commands[0], "kubectl delete pv pvc-old");
+        assert!(remedy.commands[1].starts_with(
+            "kubectl -n piraeus-datastore exec deploy/linstor-controller -- \
+             linstor resource-definition delete "
+        ));
     }
 
     #[test]

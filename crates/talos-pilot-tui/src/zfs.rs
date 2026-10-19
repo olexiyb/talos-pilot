@@ -40,7 +40,9 @@ impl ZfsPool {
 pub struct ZfsVolume {
     /// Volume (and PV) name, e.g. `pvc-…`
     pub name: String,
-    /// `namespace/name` of the PVC bound to the PV
+    /// Namespace of the `ZFSVolume` resource (the OpenEBS namespace)
+    pub namespace: String,
+    /// `namespace/name` of the PVC bound to the PV (see `crate::orphans`)
     pub pvc: Option<String>,
     /// Node holding the dataset
     pub node: String,
@@ -54,6 +56,8 @@ pub struct ZfsVolume {
     pub volume_type: String,
     /// Mounted size and used bytes, from the node's mounts (datasets only)
     pub fs: Option<(u64, u64)>,
+    /// Marked for deletion; the node destroys the dataset
+    pub deleting: bool,
 }
 
 impl ZfsVolume {
@@ -63,41 +67,21 @@ impl ZfsVolume {
     }
 }
 
-/// OpenEBS ZFS LocalPV volumes with their PVC names, `None` when the
-/// `ZFSVolume` CRD isn't installed
+/// OpenEBS ZFS LocalPV volumes, `None` when the `ZFSVolume` CRD isn't
+/// installed. Their PVC names come from the PVs, set by the caller.
 pub async fn fetch_zfs_volumes(client: &Client) -> Result<Option<Vec<ZfsVolume>>, kube::Error> {
     let gvk = GroupVersionKind::gvk("zfs.openebs.io", "v1", "ZFSVolume");
     let resource = ApiResource::from_gvk_with_plural(&gvk, "zfsvolumes");
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &resource);
-    let pvs: Api<k8s_openapi::api::core::v1::PersistentVolume> = Api::all(client.clone());
-
-    let params = ListParams::default();
-    let (volumes, pvs) = tokio::join!(api.list(&params), pvs.list(&params));
-    let volumes = match volumes {
-        Ok(list) => list,
-        Err(kube::Error::Api(e)) if e.code == 404 => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    // volume handle -> PVC; without PVs the volumes are shown by name
-    let claims: HashMap<String, String> = pvs
-        .map(|list| list.items)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|pv| {
-            let spec = pv.spec?;
-            let handle = spec.csi?.volume_handle;
-            let claim = spec.claim_ref?;
-            Some((handle, format!("{}/{}", claim.namespace?, claim.name?)))
-        })
-        .collect();
-    Ok(Some(zfs_volumes_from(volumes.items, &claims)))
+    match crate::kube_list::list(&api, &ListParams::default()).await {
+        Ok(list) => Ok(Some(zfs_volumes_from(list.items))),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
-/// Parse `ZFSVolume` objects, sorted by PVC then name
-fn zfs_volumes_from(
-    objects: Vec<DynamicObject>,
-    claims: &HashMap<String, String>,
-) -> Vec<ZfsVolume> {
+/// Parse `ZFSVolume` objects, sorted by name
+fn zfs_volumes_from(objects: Vec<DynamicObject>) -> Vec<ZfsVolume> {
     let mut volumes: Vec<ZfsVolume> = objects
         .into_iter()
         .filter_map(|obj| {
@@ -105,7 +89,9 @@ fn zfs_volumes_from(
             let spec = obj.data.get("spec")?;
             let field = |key: &str| spec.get(key).and_then(Value::as_str).map(str::to_string);
             Some(ZfsVolume {
-                pvc: claims.get(&name).cloned(),
+                deleting: obj.metadata.deletion_timestamp.is_some(),
+                namespace: obj.metadata.namespace?,
+                pvc: None,
                 node: field("ownerNodeID")?,
                 pool: field("poolName")?,
                 capacity: field("capacity").and_then(|c| c.parse().ok()),
@@ -121,13 +107,7 @@ fn zfs_volumes_from(
             })
         })
         .collect();
-    volumes.sort_by(|a, b| {
-        a.pvc
-            .is_none()
-            .cmp(&b.pvc.is_none())
-            .then_with(|| a.pvc.cmp(&b.pvc))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    volumes.sort_by(|a, b| a.name.cmp(&b.name));
     volumes
 }
 
@@ -197,7 +177,7 @@ pub async fn fetch_zfs_pools(
     let resource = ApiResource::from_gvk_with_plural(&gvk, "zfsnodes");
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &resource);
 
-    let list = match api.list(&ListParams::default()).await {
+    let list = match crate::kube_list::list(&api, &ListParams::default()).await {
         Ok(list) => list,
         Err(kube::Error::Api(e)) if e.code == 404 => return Ok(HashMap::new()),
         Err(e) => return Err(e),
@@ -274,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_zfs_volumes_with_their_pvcs() {
+    fn parses_zfs_volumes() {
         let obj: DynamicObject = k8s_openapi::serde_json::from_value(json!({
             "apiVersion": "zfs.openebs.io/v1", "kind": "ZFSVolume",
             "metadata": {"name": "pvc-1", "namespace": "openebs"},
@@ -283,10 +263,9 @@ mod tests {
             "status": {"state": "Ready"}
         }))
         .unwrap();
-        let claims = HashMap::from([("pvc-1".to_string(), "db/data-mongo-0".to_string())]);
-        let volumes = zfs_volumes_from(vec![obj], &claims);
+        let volumes = zfs_volumes_from(vec![obj]);
         assert_eq!(volumes.len(), 1);
-        assert_eq!(volumes[0].pvc.as_deref(), Some("db/data-mongo-0"));
+        assert_eq!(volumes[0].namespace, "openebs");
         assert_eq!(volumes[0].capacity, Some(1 << 30));
         assert_eq!(volumes[0].dataset(), "datapool/localpv/pvc-1");
     }
