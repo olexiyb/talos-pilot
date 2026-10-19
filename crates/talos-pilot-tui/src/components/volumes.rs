@@ -1205,6 +1205,7 @@ mod tests {
                                 cs: Some("Established".to_string()),
                                 oos_kib: Some(oos),
                                 ap_in_flight_kib: Some(0),
+                                sync: None,
                             },
                         )
                     })

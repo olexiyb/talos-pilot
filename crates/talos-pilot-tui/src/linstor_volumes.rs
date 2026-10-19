@@ -116,6 +116,103 @@ pub struct PeerObserved {
     pub oos_kib: Option<u64>,
     /// Application writes in flight to the peer (`ap_in_flight`)
     pub ap_in_flight_kib: Option<u64>,
+    /// Progress of a running resync or verify with the peer
+    pub sync: Option<SyncProgress>,
+}
+
+/// A resync (or online verify) in progress, from the `sync'ed:` /
+/// `finish:` lines DRBD adds to debugfs `proc_drbd` while one runs
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SyncProgress {
+    /// Online verify rather than resync
+    pub verify: bool,
+    pub percent: f32,
+    /// Estimated seconds left; `None` when DRBD shows `∞`: the out-of-sync
+    /// blocks aren't shrinking under the current writes
+    pub finish_secs: Option<u64>,
+    /// Speed over the last ~18 s (KiB/s)
+    pub speed_kib: Option<u64>,
+    /// No progress for over 3 minutes
+    pub stalled: bool,
+}
+
+impl SyncProgress {
+    /// e.g. `resync 37.0%, 109 MiB/s, ~4m 12s left`
+    pub fn describe(&self) -> String {
+        let what = if self.verify { "verify" } else { "resync" };
+        let mut text = format!("{what} {:.1}%", self.percent);
+        if let Some(speed) = self.speed_kib {
+            text.push_str(&format!(", {}/s", format_kib(speed)));
+        }
+        if self.stalled {
+            text.push_str(", stalled for over 3 min");
+        } else {
+            match self.finish_secs {
+                Some(secs) => text.push_str(&format!(", ~{} left", format_eta(secs))),
+                None => text.push_str(", not converging under the current writes"),
+            }
+        }
+        text
+    }
+}
+
+/// Seconds as `1h 05m`, `4m 12s` or `9s`
+fn format_eta(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Resync progress from a debugfs `proc_drbd` file, `None` when no resync
+/// or verify is running (or the lines can't be parsed):
+///
+/// ```text
+///     [===>................] sync'ed: 18.4% (9012/11048)M
+///     finish: 0:04:12 speed: 112,345 (110,000 -- 98,000) want: 250,000 K/sec
+/// ```
+fn parse_sync_progress(content: &str) -> Option<SyncProgress> {
+    let mut words = content.split_whitespace().peekable();
+    let mut progress = None::<SyncProgress>;
+    while let Some(word) = words.next() {
+        match word {
+            "sync'ed:" | "verified:" => {
+                let percent = words.next()?.strip_suffix('%')?.parse().ok()?;
+                progress = Some(SyncProgress {
+                    verify: word == "verified:",
+                    percent,
+                    ..Default::default()
+                });
+            }
+            "finish:" => {
+                let p = progress.as_mut()?;
+                let value = words.next()?;
+                p.finish_secs = if value == "∞" {
+                    None
+                } else {
+                    let parts: Vec<u64> = value
+                        .split(':')
+                        .map(|n| n.parse().ok())
+                        .collect::<Option<_>>()?;
+                    match parts[..] {
+                        [h, m, s] => Some(h * 3600 + m * 60 + s),
+                        _ => return None,
+                    }
+                };
+            }
+            "speed:" => {
+                let p = progress.as_mut()?;
+                p.speed_kib = words.next()?.replace(',', "").parse().ok();
+            }
+            "(stalled)" => progress.as_mut()?.stalled = true,
+            _ => {}
+        }
+    }
+    progress
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -469,6 +566,7 @@ pub async fn observe_drbd(
                 let entry = observed.peers.entry(peer).or_default();
                 entry.cs = parsed.cs;
                 entry.oos_kib = parsed.oos_kib;
+                entry.sync = parse_sync_progress(&content);
             }
             Probe::PeerConnection(peer) => {
                 observed.peers.entry(peer).or_default().ap_in_flight_kib =
@@ -742,10 +840,14 @@ pub fn volume_issues(volume: &LinstorVolume) -> Vec<Issue> {
                     });
                 let peer_is_primary = volume.replicas.iter().any(|p| &p.node == peer && p.in_use);
                 if !established {
+                    let progress = seen
+                        .sync
+                        .as_ref()
+                        .map_or_else(|| "resyncing".to_string(), SyncProgress::describe);
                     push(
                         Severity::Warning,
                         format!(
-                            "{} → {peer}: {} out of sync (resyncing)",
+                            "{} → {peer}: {} out of sync ({progress})",
                             r.node,
                             format_kib(oos)
                         ),
@@ -1061,6 +1163,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_resync_progress() {
+        let syncing = "1001: cs:SyncSource ro:Primary/Secondary ds:UpToDate/Inconsistent C r-----\n    ns:0 nr:0 dw:0 dr:0 al:0 bm:0 lo:0 pe:[0;0] ua:0 ap:[0;0] ep:1 wo:2 oos:9228288\n\t[===>................] sync'ed: 18.4% (9012/11048)M\n\tfinish: 0:04:12 speed: 112,345 (110,000 -- 98,000) K/sec\n\t 0% sector pos: 0/23068672\n";
+        let progress = parse_sync_progress(syncing).unwrap();
+        assert_eq!(
+            progress,
+            SyncProgress {
+                verify: false,
+                percent: 18.4,
+                finish_secs: Some(252),
+                speed_kib: Some(112_345),
+                stalled: false,
+            }
+        );
+        assert_eq!(
+            progress.describe(),
+            "resync 18.4%, 109.7 MiB/s, ~4m 12s left"
+        );
+
+        let stuck = "\t[>....................] verified:  2.0% (100/102)K\n\tfinish: ∞ speed: 0 (0 -- 0) want: 250,000 K/sec (stalled)\n";
+        let progress = parse_sync_progress(stuck).unwrap();
+        assert!(progress.verify && progress.stalled);
+        assert_eq!(progress.finish_secs, None);
+        assert_eq!(
+            progress.describe(),
+            "verify 2.0%, 0 KiB/s, stalled for over 3 min"
+        );
+
+        assert_eq!(parse_sync_progress("1015: cs:Established oos:0"), None);
+        assert_eq!(format_eta(3_900), "1h 05m");
+        assert_eq!(format_eta(9), "9s");
+    }
+
+    #[test]
     fn suspended_io_is_an_error() {
         let resources = json!([
             resource("bc1", true, "UpToDate", &[("bc2", true, "Established")]),
@@ -1130,6 +1265,7 @@ mod tests {
                     cs: Some("Established".to_string()),
                     oos_kib: Some(oos),
                     ap_in_flight_kib: Some(ap),
+                    sync: None,
                 },
             )]),
         };
@@ -1169,6 +1305,7 @@ mod tests {
                             cs: Some("Established".to_string()),
                             oos_kib: Some(*oos),
                             ap_in_flight_kib: Some(0),
+                            sync: None,
                         },
                     )
                 })

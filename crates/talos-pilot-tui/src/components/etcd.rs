@@ -1,6 +1,10 @@
 //! Etcd cluster status component
 //!
-//! Displays etcd cluster health with member list and details.
+//! Displays etcd cluster health with member list and details, and checks
+//! each member's status for what etcd's own health doesn't flag yet:
+//! a fragmented database (space a defrag would reclaim), entries committed
+//! but not applied, a member far behind the leader, and a database close to
+//! etcd's default quota.
 
 use crate::action::Action;
 use crate::components::{Component, KERNEL_SERVICE, LogNode};
@@ -32,6 +36,116 @@ pub struct EtcdMember {
 /// Default auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
 
+/// A defrag is worth it when at least this share of the DB file is free...
+const DEFRAG_MIN_FREE_PCT: i64 = 50;
+/// ...and that is at least this much space
+const DEFRAG_MIN_FREE_BYTES: i64 = 200 << 20;
+/// Committed but not applied entries worth a look; etcd itself rejects new
+/// requests ("too many requests") past 5000
+const APPLY_LAG_WARN: u64 = 1_000;
+const APPLY_LAG_ERROR: u64 = 5_000;
+/// Raft entries a member may trail the leader by. Statuses are read a few
+/// milliseconds apart, so a busy cluster shows small gaps even when healthy.
+const BEHIND_LEADER_WARN: u64 = 10_000;
+/// etcd's default `quota-backend-bytes`; past it etcd raises NOSPACE and
+/// stops accepting writes
+const DEFAULT_QUOTA_BYTES: i64 = 2 << 30;
+const QUOTA_WARN_PCT: i64 = 80;
+
+/// Something to look at on a member
+#[derive(Debug, Clone, PartialEq)]
+pub struct EtcdCheck {
+    pub error: bool,
+    pub text: String,
+}
+
+/// Checks of every reachable member's status, errors first
+pub fn member_checks(members: &[EtcdMember]) -> Vec<EtcdCheck> {
+    let statuses: Vec<(&EtcdMember, &EtcdMemberStatus)> = members
+        .iter()
+        .filter_map(|m| Some((m, m.status.as_ref()?)))
+        .collect();
+    let leader_index = statuses
+        .iter()
+        .find(|(_, s)| s.is_leader())
+        .map(|(_, s)| s.raft_index);
+    let mut checks = Vec::new();
+    for (member, status) in &statuses {
+        let name = &member.info.hostname;
+        let lag = status.raft_index.saturating_sub(status.raft_applied_index);
+        if lag >= APPLY_LAG_WARN {
+            checks.push(EtcdCheck {
+                error: lag >= APPLY_LAG_ERROR,
+                text: format!("{name}: {lag} entries committed but not applied (slow disk?)"),
+            });
+        }
+        if let Some(leader) = leader_index {
+            let behind = leader.saturating_sub(status.raft_index);
+            if behind >= BEHIND_LEADER_WARN {
+                checks.push(EtcdCheck {
+                    error: false,
+                    text: format!("{name}: {behind} entries behind the leader"),
+                });
+            }
+        }
+        if let Some(free) = defrag_reclaims(status) {
+            checks.push(EtcdCheck {
+                error: false,
+                text: format!(
+                    "{name}: defrag would reclaim {} of {} ({}% of the file unused)",
+                    format_bytes_signed(free),
+                    format_bytes_signed(status.db_size),
+                    free * 100 / status.db_size
+                ),
+            });
+        }
+        if status.db_size * 100 >= DEFAULT_QUOTA_BYTES * QUOTA_WARN_PCT {
+            checks.push(EtcdCheck {
+                error: false,
+                text: format!(
+                    "{name}: DB {} is {}% of etcd's default 2 GiB quota (unless \
+                     quota-backend-bytes is raised)",
+                    format_bytes_signed(status.db_size),
+                    status.db_size * 100 / DEFAULT_QUOTA_BYTES
+                ),
+            });
+        }
+    }
+    checks.sort_by_key(|c| !c.error);
+    checks
+}
+
+/// Bytes a defrag would give back, when it is worth one
+fn defrag_reclaims(status: &EtcdMemberStatus) -> Option<i64> {
+    let free = status.db_size - status.db_size_in_use;
+    (status.db_size > 0
+        && free >= DEFRAG_MIN_FREE_BYTES
+        && free * 100 >= status.db_size * DEFRAG_MIN_FREE_PCT)
+        .then_some(free)
+}
+
+/// `talosctl etcd defrag` for each member worth defragmenting, followers
+/// first and the leader last: a defrag blocks the member while it runs, so
+/// one at a time
+pub fn defrag_commands(members: &[EtcdMember], context: Option<&str>) -> Vec<String> {
+    let mut targets: Vec<(bool, String)> = members
+        .iter()
+        .filter_map(|m| {
+            let status = m.status.as_ref()?;
+            defrag_reclaims(status)?;
+            Some((status.is_leader(), m.info.ip_address()?))
+        })
+        .collect();
+    targets.sort();
+    let context = context
+        .map(|c| format!(" --context {c}"))
+        .unwrap_or_default();
+    targets
+        .into_iter()
+        .map(|(_, ip)| format!("talosctl{context} -n {ip} etcd defrag"))
+        .collect()
+}
+
 /// Loaded etcd data (wrapped by AsyncState)
 #[derive(Debug, Clone, Default)]
 pub struct EtcdData {
@@ -61,6 +175,9 @@ pub struct EtcdComponent {
 
     /// Client for API calls
     client: Option<TalosClient>,
+
+    /// talosctl context of the cluster, for the copied defrag commands
+    context: Option<String>,
 }
 
 impl Default for EtcdComponent {
@@ -79,12 +196,38 @@ impl EtcdComponent {
             table_state,
             auto_refresh: true,
             client: None,
+            context: None,
         }
     }
 
     /// Set the client for making API calls
     pub fn set_client(&mut self, client: TalosClient) {
         self.client = Some(client);
+    }
+
+    /// Name the talosctl context in copied commands
+    pub fn set_context(&mut self, context: Option<String>) {
+        self.context = context;
+    }
+
+    /// Copy the defrag commands, one per line, with a reminder to run them
+    /// one at a time
+    fn copy_defrag(&self) {
+        let Some(data) = self.data() else {
+            return;
+        };
+        let commands = defrag_commands(data.members.items(), self.context.as_deref());
+        if commands.is_empty() {
+            return;
+        }
+        let text = format!(
+            "# One member at a time, followers first and the leader last;\n\
+             # each blocks that member until it finishes\n{}",
+            commands.join("\n")
+        );
+        if let Err(e) = crate::clipboard::copy_to_clipboard(text) {
+            tracing::warn!("Failed to copy defrag commands: {}", e);
+        }
     }
 
     /// Set an error message
@@ -320,6 +463,35 @@ impl EtcdComponent {
                     .map(|s| s.raft_index.to_string())
                     .unwrap_or_else(|| "-".to_string());
 
+                // Share of the DB file in use; low means a defrag reclaims space
+                let in_use = match &member.status {
+                    Some(s) if s.db_size > 0 => {
+                        let pct = s.db_size_in_use * 100 / s.db_size;
+                        let color = if defrag_reclaims(s).is_some() {
+                            Color::Yellow
+                        } else {
+                            Color::Reset
+                        };
+                        Cell::from(format!("{pct}%")).style(Style::default().fg(color))
+                    }
+                    _ => Cell::from("-"),
+                };
+                // Entries committed but not applied yet
+                let lag = match &member.status {
+                    Some(s) => {
+                        let lag = s.raft_index.saturating_sub(s.raft_applied_index);
+                        let color = if lag >= APPLY_LAG_ERROR {
+                            Color::Red
+                        } else if lag >= APPLY_LAG_WARN {
+                            Color::Yellow
+                        } else {
+                            Color::Reset
+                        };
+                        Cell::from(lag.to_string()).style(Style::default().fg(color))
+                    }
+                    None => Cell::from("-"),
+                };
+
                 let errors = member
                     .status
                     .as_ref()
@@ -347,7 +519,9 @@ impl EtcdComponent {
                     Cell::from(status_full).style(Style::default().fg(status_color)),
                     Cell::from(endpoint),
                     Cell::from(db_size),
+                    in_use,
                     Cell::from(raft_idx),
+                    lag,
                     Cell::from(errors),
                 ])
             })
@@ -358,7 +532,9 @@ impl EtcdComponent {
             Cell::from("STATUS"),
             Cell::from("ENDPOINT"),
             Cell::from("DB SIZE"),
+            Cell::from("IN USE"),
             Cell::from("RAFT IDX"),
+            Cell::from("LAG"),
             Cell::from("ERRORS"),
         ])
         .style(Style::default().add_modifier(Modifier::DIM))
@@ -370,7 +546,9 @@ impl EtcdComponent {
             Constraint::Length(10),     // STATUS
             Constraint::Percentage(30), // ENDPOINT (flexible)
             Constraint::Length(10),     // DB SIZE
+            Constraint::Length(7),      // IN USE
             Constraint::Length(12),     // RAFT IDX
+            Constraint::Length(7),      // LAG
             Constraint::Length(8),      // ERRORS
         ];
 
@@ -505,17 +683,18 @@ impl EtcdComponent {
         frame.render_widget(para, area);
     }
 
-    /// Draw the alarms section
+    /// Draw the alarms and member checks
     fn draw_alarms(&self, frame: &mut Frame, area: Rect) {
         let Some(data) = self.data() else {
             return;
         };
 
-        let content = if data.alarms.is_empty() {
-            Line::from(vec![
+        let mut lines = Vec::new();
+        if data.alarms.is_empty() {
+            lines.push(Line::from(vec![
                 Span::raw("Alarms: "),
                 Span::styled("None", Style::default().fg(Color::Green)),
-            ])
+            ]));
         } else {
             let alarm_text: Vec<Span> = data
                 .alarms
@@ -530,11 +709,32 @@ impl EtcdComponent {
                     ]
                 })
                 .collect();
-            Line::from(alarm_text)
-        };
+            lines.push(Line::from(alarm_text));
+        }
+        let checks = member_checks(data.members.items());
+        if checks.is_empty() {
+            lines.push(Line::from(vec![
+                Span::raw("Checks: "),
+                Span::styled(
+                    "OK (fragmentation, apply lag, quota)",
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+        }
+        for check in checks {
+            let (symbol, color) = if check.error {
+                ("✗ ", Color::Red)
+            } else {
+                ("⚠ ", Color::Yellow)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(symbol, Style::default().fg(color)),
+                Span::styled(check.text, Style::default().fg(color)),
+            ]));
+        }
 
         let para =
-            Paragraph::new(content).block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
+            Paragraph::new(lines).block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
         frame.render_widget(para, area);
     }
 
@@ -555,6 +755,8 @@ impl EtcdComponent {
             Span::raw(" member logs  "),
             Span::styled("[r]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" refresh  "),
+            Span::styled("[c]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" copy defrag  "),
             Span::styled("[a]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" auto:"),
             auto_status,
@@ -581,6 +783,10 @@ impl Component for EtcdComponent {
                 Ok(None)
             }
             KeyCode::Char('r') => Ok(Some(Action::Refresh)),
+            KeyCode::Char('c') => {
+                self.copy_defrag();
+                Ok(None)
+            }
             KeyCode::Char('a') => {
                 // Toggle auto-refresh
                 self.auto_refresh = !self.auto_refresh;
@@ -685,11 +891,8 @@ impl Component for EtcdComponent {
         let member_count = data.members.len().max(1);
         let table_height = (member_count + 2) as u16; // header + members + padding
         let detail_height = 6u16;
-        let alarm_height = if data.alarms.is_empty() {
-            2
-        } else {
-            (data.alarms.len() + 2) as u16
-        };
+        // Alarms line, then one line per check (or "Checks: OK"), plus borders
+        let alarm_height = (member_checks(data.members.items()).len().max(1) + 3) as u16;
 
         // Total content height (excluding flexible space)
         let content_height = 3 + table_height + 1 + detail_height + 1 + alarm_height + 1;
@@ -751,5 +954,135 @@ impl crate::components::BackgroundRefresh for EtcdComponent {
         }
         let index = self.data().map(|d| d.members.selected_index()).unwrap_or(0);
         self.table_state.select(Some(index));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: i64 = 1 << 20;
+
+    fn member(
+        name: &str,
+        id: u64,
+        leader: u64,
+        db: i64,
+        in_use: i64,
+        raft: (u64, u64),
+    ) -> EtcdMember {
+        EtcdMember {
+            info: EtcdMemberInfo {
+                id,
+                hostname: name.to_string(),
+                peer_urls: vec![format!("https://10.0.0.{id}:2380")],
+                client_urls: Vec::new(),
+                is_learner: false,
+            },
+            status: Some(EtcdMemberStatus {
+                node: name.to_string(),
+                member_id: id,
+                protocol_version: "3.5".to_string(),
+                db_size: db,
+                db_size_in_use: in_use,
+                leader_id: leader,
+                raft_index: raft.0,
+                raft_term: 7,
+                raft_applied_index: raft.1,
+                errors: Vec::new(),
+                is_learner: false,
+            }),
+        }
+    }
+
+    /// `TALOS_PILOT_LIVE_CONTEXT=bc cargo test --lib live_etcd_checks -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_etcd_checks() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context =
+            std::env::var("TALOS_PILOT_LIVE_CONTEXT").expect("set TALOS_PILOT_LIVE_CONTEXT");
+        let mut etcd = EtcdComponent::new();
+        etcd.set_client(TalosClient::from_named_context(&context).await.unwrap());
+        etcd.set_context(Some(context.clone()));
+        etcd.refresh().await.unwrap();
+        let data = etcd.data().expect("no etcd data");
+        for m in data.members.items() {
+            match &m.status {
+                Some(s) => println!(
+                    "{}: db {} in use {} raft {} applied {} leader {}",
+                    m.info.hostname,
+                    format_bytes_signed(s.db_size),
+                    format_bytes_signed(s.db_size_in_use),
+                    s.raft_index,
+                    s.raft_applied_index,
+                    s.is_leader()
+                ),
+                None => println!("{}: unreachable", m.info.hostname),
+            }
+        }
+        for c in member_checks(data.members.items()) {
+            println!("check (error={}): {}", c.error, c.text);
+        }
+        for cmd in defrag_commands(data.members.items(), Some(&context)) {
+            println!("cmd: {cmd}");
+        }
+    }
+
+    #[test]
+    fn healthy_members_have_no_checks() {
+        let members = [
+            member("cp1", 1, 1, 120 * MIB, 100 * MIB, (5_000, 4_998)),
+            member("cp2", 2, 1, 120 * MIB, 100 * MIB, (4_990, 4_990)),
+            // Mostly free, but too small to be worth a defrag
+            member("cp3", 3, 1, 60 * MIB, 10 * MIB, (5_000, 5_000)),
+        ];
+        assert_eq!(member_checks(&members), Vec::new());
+        assert!(defrag_commands(&members, Some("bc")).is_empty());
+    }
+
+    #[test]
+    fn flags_fragmentation_lag_and_quota_and_orders_defrag() {
+        let members = [
+            member("cp1", 1, 1, 900 * MIB, 300 * MIB, (100_000, 100_000)),
+            member("cp2", 2, 1, 900 * MIB, 400 * MIB, (100_000, 93_000)),
+            member("cp3", 3, 1, 1700 * MIB, 1600 * MIB, (85_000, 85_000)),
+        ];
+        let texts: Vec<(bool, String)> = member_checks(&members)
+            .into_iter()
+            .map(|c| (c.error, c.text))
+            .collect();
+        assert_eq!(
+            texts[0],
+            (
+                true,
+                "cp2: 7000 entries committed but not applied (slow disk?)".to_string()
+            )
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(e, t)| !e && t.starts_with("cp1: defrag would reclaim"))
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(_, t)| t == "cp3: 15000 entries behind the leader")
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(_, t)| t.starts_with("cp3: DB") && t.contains("83%"))
+        );
+        assert!(!texts.iter().any(|(_, t)| t.starts_with("cp3: defrag")));
+
+        // Followers first, the leader last
+        assert_eq!(
+            defrag_commands(&members, Some("bc")),
+            [
+                "talosctl --context bc -n 10.0.0.2 etcd defrag",
+                "talosctl --context bc -n 10.0.0.1 etcd defrag",
+            ]
+        );
     }
 }

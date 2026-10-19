@@ -1237,6 +1237,7 @@ impl App {
                 let mut etcd = EtcdComponent::new();
 
                 // Set the client and refresh data
+                etcd.set_context(self.cluster.current_context_name().map(str::to_string));
                 if let Some(client) = self.cluster.client() {
                     etcd.set_client(client.clone());
                     self.refresh_job = Some(RefreshJob::Etcd(spawn_refresh!(etcd)));
