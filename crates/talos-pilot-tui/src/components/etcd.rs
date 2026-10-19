@@ -3,7 +3,7 @@
 //! Displays etcd cluster health with member list and details.
 
 use crate::action::Action;
-use crate::components::Component;
+use crate::components::{Component, KERNEL_SERVICE, LogNode};
 use crate::ui_ext::QuorumStateExt;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -594,20 +594,28 @@ impl Component for EtcdComponent {
                 if data.members.is_empty() {
                     return Ok(None);
                 }
-                // Use first member's IP as the "node" (hostnames may not be resolvable)
-                // In practice, with the current API this shows etcd logs from all connected nodes
-                let node = data
+                // Every member, addressed by IP (hostnames may not resolve)
+                let nodes: Vec<LogNode> = data
                     .members
                     .items()
-                    .first()
-                    .and_then(|m| m.info.ip_address())
-                    .unwrap_or_else(|| "controlplane".to_string());
-                let etcd_vec = vec!["etcd".to_string()];
+                    .iter()
+                    .filter_map(|m| {
+                        Some(LogNode {
+                            name: m.info.hostname.clone(),
+                            ip: m.info.ip_address()?,
+                            services: Some(vec!["etcd".to_string()]),
+                        })
+                    })
+                    .collect();
+                if nodes.is_empty() {
+                    return Ok(None);
+                }
                 Ok(Some(Action::ShowMultiLogs(
-                    node,
-                    "controlplane".to_string(),
-                    etcd_vec.clone(),
-                    etcd_vec,
+                    "etcd".to_string(),
+                    format!("{} members", nodes.len()),
+                    nodes,
+                    vec!["etcd".to_string()],
+                    vec!["etcd".to_string(), KERNEL_SERVICE.to_string()],
                 )))
             }
             KeyCode::Enter => {
@@ -622,8 +630,13 @@ impl Component for EtcdComponent {
                         .unwrap_or_else(|| member.info.hostname.clone());
                     let etcd_vec = vec!["etcd".to_string()];
                     return Ok(Some(Action::ShowMultiLogs(
-                        node,
+                        node.clone(),
                         "controlplane".to_string(),
+                        vec![LogNode {
+                            name: member.info.hostname.clone(),
+                            ip: node,
+                            services: Some(etcd_vec.clone()),
+                        }],
                         etcd_vec.clone(),
                         etcd_vec,
                     )));

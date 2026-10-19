@@ -3,7 +3,7 @@
 //! "Is the network the problem?"
 
 use crate::action::Action;
-use crate::components::Component;
+use crate::components::{Component, LogNode};
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -2762,6 +2762,11 @@ impl NetworkStatsComponent {
         Ok(Some(Action::ShowMultiLogs(
             self.address.clone(),
             "".to_string(), // role not needed for single service
+            vec![LogNode {
+                name: self.hostname.clone(),
+                ip: self.address.clone(),
+                services: Some(service_vec.clone()),
+            }],
             service_vec.clone(),
             service_vec, // from network view we only know about this service
         )))

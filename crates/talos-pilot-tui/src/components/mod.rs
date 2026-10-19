@@ -27,7 +27,7 @@ pub use home::HomeComponent;
 pub use insecure::InsecureComponent;
 pub use lifecycle::LifecycleComponent;
 pub use logs::LogsComponent;
-pub use multi_logs::MultiLogsComponent;
+pub use multi_logs::{KERNEL_SERVICE, LogNode, MultiLogsComponent};
 pub use network::NetworkStatsComponent;
 pub use node_operations::NodeOperationsComponent;
 pub use processes::{ProcessNode, ProcessesComponent};

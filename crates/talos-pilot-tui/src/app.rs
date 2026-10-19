@@ -74,9 +74,6 @@ macro_rules! spawn_refresh {
     }};
 }
 
-/// First logs fetch of the logs view: (service, log text) pairs, or an error
-type LogsFetch = std::result::Result<Vec<(String, String)>, String>;
-
 /// Whether a key event is Ctrl+C
 fn is_ctrl_c(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
@@ -150,8 +147,6 @@ pub struct App {
     config_path: Option<String>,
     /// In-flight background refresh of the current view (see `start_refresh_job`)
     refresh_job: Option<RefreshJob>,
-    /// In-flight first logs fetch of the logs view (see `poll_view_setup`)
-    logs_fetch: Option<JoinHandle<LogsFetch>>,
     /// In-flight Kubernetes client creation for rolling operations
     rolling_k8s_fetch: Option<JoinHandle<Option<kube::Client>>>,
     /// Whether running in insecure mode (no TLS)
@@ -209,7 +204,6 @@ impl App {
             action_tx,
             config_path,
             refresh_job: None,
-            logs_fetch: None,
             rolling_k8s_fetch: None,
             insecure,
             insecure_endpoint,
@@ -760,24 +754,10 @@ impl App {
         }
     }
 
-    /// Finish view setup that ran in the background: the first logs fetch of
-    /// the logs view, and the Kubernetes client of rolling operations
+    /// Finish view setup that ran in the background: the Kubernetes client
+    /// of rolling operations
     fn poll_view_setup(&mut self) {
         use futures::FutureExt;
-
-        if self.logs_fetch.as_ref().is_some_and(|h| h.is_finished())
-            && let Some(Some(Ok(result))) = self.logs_fetch.take().map(|h| h.now_or_never())
-            && let Some(multi_logs) = &mut self.multi_logs
-        {
-            match result {
-                Ok(logs) => {
-                    multi_logs.set_logs(logs);
-                    // Auto-start streaming for live updates
-                    multi_logs.start_streaming();
-                }
-                Err(e) => multi_logs.set_error(e),
-            }
-        }
 
         if self
             .rolling_k8s_fetch
@@ -1170,46 +1150,22 @@ impl App {
                     tracing::warn!("{:?} refresh blocked the UI for {:?}", self.view, elapsed);
                 }
             }
-            Action::ShowMultiLogs(node_ip, node_role, active_services, all_services) => {
-                // Switch to multi-service logs view
-                tracing::info!("Viewing multi-service logs for node: {}", node_ip);
+            Action::ShowMultiLogs(title, subtitle, nodes, active_services, all_services) => {
+                tracing::info!("Viewing logs of {} ({} nodes)", title, nodes.len());
 
                 // Create multi-logs component with all services, marking active ones
-                let mut multi_logs = MultiLogsComponent::new(
-                    node_ip.clone(),
-                    node_role,
-                    active_services.clone(),
-                    all_services,
-                );
+                let mut multi_logs =
+                    MultiLogsComponent::new(title, subtitle, nodes, active_services, all_services);
                 multi_logs.set_level_filter(self.log_level_filter);
 
-                // Fetch logs from active services and set up client for streaming
+                // Each stream targets its node through the cluster's client and
+                // starts with the last `tail_lines` lines, so there is no
+                // separate first fetch
                 if let Some(client) = self.cluster.client() {
-                    // Use node targeting through VIP
-                    let node_client = client.with_node(&node_ip);
-
-                    // Set the client for streaming capability
-                    multi_logs.set_client(node_client.clone(), self.tail_lines);
-
-                    // First fetch in the background (see `poll_view_setup`)
-                    let tail_lines = self.tail_lines;
-                    if let Some(h) = self.logs_fetch.take() {
-                        h.abort();
-                    }
-                    self.logs_fetch = Some(tokio::spawn(async move {
-                        let service_refs: Vec<&str> =
-                            active_services.iter().map(|s| s.as_str()).collect();
-                        match tokio::time::timeout(
-                            Duration::from_secs(15),
-                            node_client.logs_multi(&service_refs, tail_lines),
-                        )
-                        .await
-                        {
-                            Ok(Ok(logs)) => Ok(logs),
-                            Ok(Err(e)) => Err(e.to_string()),
-                            Err(_) => Err("Timed out fetching logs after 15s".to_string()),
-                        }
-                    }));
+                    multi_logs.set_client(client.clone(), self.tail_lines);
+                    multi_logs.start_streaming();
+                } else {
+                    multi_logs.set_error("Not connected to the cluster".to_string());
                 }
 
                 self.multi_logs = Some(multi_logs);

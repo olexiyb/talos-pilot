@@ -1,4 +1,9 @@
 //! Multi-service logs component - Stern-style interleaved log viewer
+//!
+//! Streams the chosen services from one node, or from several nodes at once
+//! (a cluster or control plane / workers group), merged by timestamp with a
+//! node column. The kernel log (dmesg) is offered as the pseudo-service
+//! `kernel`. For watching only: nothing here decides health.
 
 use crate::action::Action;
 use crate::components::Component;
@@ -14,13 +19,74 @@ use ratatui::{
         ScrollbarState,
     },
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use talos_pilot_core::AsyncState;
 use talos_pilot_core::constants::MAX_LOG_ENTRIES;
 
 /// Maximum lines to process per tick during streaming
 /// Higher = more responsive but could block UI if too high
 const MAX_LINES_PER_TICK: usize = 500;
+
+/// Pseudo-service for the kernel log (dmesg)
+pub const KERNEL_SERVICE: &str = "kernel";
+
+/// Widest node name shown in the node column
+const NODE_COLUMN_MAX: usize = 14;
+
+/// A node to stream logs from
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogNode {
+    pub name: String,
+    /// Talos API address
+    pub ip: String,
+    /// Services it runs; `None` when not known yet (every service is tried)
+    pub services: Option<Vec<String>>,
+}
+
+/// Where one (node, service) stream is
+#[derive(Debug, Clone, PartialEq)]
+enum StreamStatus {
+    /// Requested, nothing received yet. Talos only answers a log request
+    /// with its first line, so a quiet service waits here too.
+    Waiting,
+    Streaming,
+    Failed(String),
+    /// The node closed the stream
+    Ended,
+}
+
+/// What a stream task reports
+#[derive(Debug)]
+enum StreamEvent {
+    Line {
+        node: usize,
+        service: String,
+        line: String,
+    },
+    Status {
+        node: usize,
+        service: String,
+        status: StreamStatus,
+    },
+}
+
+/// A node in the nodes pane
+#[derive(Debug, Clone)]
+struct NodeState {
+    name: String,
+    ip: String,
+    services: Option<HashSet<String>>,
+    color: Color,
+    active: bool,
+    entry_count: usize,
+}
+
+impl NodeState {
+    /// Whether the node runs `service` (unknown counts as yes)
+    fn runs(&self, service: &str) -> bool {
+        service == KERNEL_SERVICE || self.services.as_ref().is_none_or(|s| s.contains(service))
+    }
+}
 
 /// Color palette for services (deterministic assignment)
 const SERVICE_COLORS: &[Color] = &[
@@ -96,6 +162,8 @@ impl LogLevel {
 /// A log entry from any service
 #[derive(Debug, Clone)]
 pub(crate) struct MultiLogEntry {
+    /// Index of the node this entry came from
+    node: usize,
     /// Service this entry came from
     service_id: String,
     /// Assigned color for this service
@@ -139,6 +207,7 @@ enum FloatingPane {
     None,
     Services,
     Levels,
+    Nodes,
 }
 
 /// Which levels are shown, in panel order: Error, Warn, Info, Debug, Other.
@@ -203,10 +272,16 @@ pub(crate) struct MultiLogsData {
 
 /// Multi-service logs component
 pub struct MultiLogsComponent {
-    /// Node IP being viewed
-    node_ip: String,
-    /// Node role (controlplane/worker)
-    node_role: String,
+    /// What is viewed: a node address, or a cluster / group name
+    title: String,
+    /// Node role (controlplane/worker), or the node count for a group
+    subtitle: String,
+
+    /// Nodes streamed from, in the nodes pane
+    nodes: Vec<NodeState>,
+    /// Selected node in the nodes pane
+    selected_node: usize,
+    nodes_state: ListState,
 
     /// All services available
     services: Vec<ServiceState>,
@@ -251,11 +326,14 @@ pub struct MultiLogsComponent {
     tail_lines: i32,
     /// Whether streaming is active
     streaming: bool,
-    /// Channel to receive streamed log lines (service_id, line)
-    stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
-    /// Sender for stream aggregator (kept alive to prevent channel close)
-    #[allow(dead_code)]
-    stream_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
+    /// Channel the stream tasks report lines and status on
+    stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>>,
+    stream_tx: Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
+    /// Running stream task and its status, per (node index, service)
+    streams: HashMap<(usize, String), (tokio::task::JoinHandle<()>, StreamStatus)>,
+    /// Streams started before: a restart asks only for new lines, so the
+    /// tail already shown isn't added again
+    started: HashSet<(usize, String)>,
     /// Animation frame for pulsing indicator
     pulse_frame: u8,
     /// Whether to wrap long lines
@@ -271,11 +349,27 @@ impl MultiLogsComponent {
     /// - active_services: services to initially show logs for
     /// - all_services: all available services (inactive ones shown greyed out in sidebar)
     pub fn new(
-        node_ip: String,
-        node_role: String,
+        title: String,
+        subtitle: String,
+        nodes: Vec<LogNode>,
         active_services: Vec<String>,
         all_services: Vec<String>,
     ) -> Self {
+        let nodes: Vec<NodeState> = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| NodeState {
+                name: n.name,
+                ip: n.ip,
+                services: n.services.map(|s| s.into_iter().collect()),
+                color: SERVICE_COLORS[(i + 3) % SERVICE_COLORS.len()],
+                active: true,
+                entry_count: 0,
+            })
+            .collect();
+        let mut nodes_state = ListState::default();
+        nodes_state.select(Some(0));
+
         // Build a set of active service IDs for quick lookup
         let active_set: std::collections::HashSet<&str> =
             active_services.iter().map(|s| s.as_str()).collect();
@@ -330,8 +424,11 @@ impl MultiLogsComponent {
         levels_state.select(Some(0));
 
         Self {
-            node_ip,
-            node_role,
+            title,
+            subtitle,
+            nodes,
+            selected_node: 0,
+            nodes_state,
             services,
             selected_service: 0,
             sidebar_state,
@@ -359,11 +456,60 @@ impl MultiLogsComponent {
             streaming: false,
             stream_rx: None,
             stream_tx: None,
+            streams: HashMap::new(),
+            started: HashSet::new(),
             pulse_frame: 0,
             wrap: false,
             selection_start: None,
             cursor: 0,
         }
+    }
+
+    /// More than one node: show the node column and the nodes pane
+    fn multi_node(&self) -> bool {
+        self.nodes.len() > 1
+    }
+
+    /// Width of the node column (0 for a single node)
+    fn node_column_width(&self) -> usize {
+        if !self.multi_node() {
+            return 0;
+        }
+        self.nodes
+            .iter()
+            .map(|n| n.name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(NODE_COLUMN_MAX)
+    }
+
+    /// Streams in each state: (streaming, waiting, failed)
+    fn stream_counts(&self) -> (usize, usize, usize) {
+        let mut counts = (0, 0, 0);
+        for (_, status) in self.streams.values() {
+            match status {
+                StreamStatus::Streaming => counts.0 += 1,
+                StreamStatus::Waiting => counts.1 += 1,
+                StreamStatus::Failed(_) => counts.2 += 1,
+                StreamStatus::Ended => {}
+            }
+        }
+        counts
+    }
+
+    /// Failed streams of a node, as `service: error`
+    fn node_failures(&self, node: usize) -> Vec<String> {
+        let mut failures: Vec<String> = self
+            .streams
+            .iter()
+            .filter(|((n, _), _)| *n == node)
+            .filter_map(|((_, service), (_, status))| match status {
+                StreamStatus::Failed(e) => Some(format!("{service}: {e}")),
+                _ => None,
+            })
+            .collect();
+        failures.sort();
+        failures
     }
 
     /// Set the Talos client for streaming
@@ -382,54 +528,58 @@ impl MultiLogsComponent {
         self.state.data_mut()
     }
 
-    /// Start streaming logs from all active services
+    /// Stream every active service from every active node that runs it.
+    /// Streams already running are kept; only missing ones are started.
     pub fn start_streaming(&mut self) {
-        let client = match &self.client {
-            Some(c) => c.clone(),
-            None => return,
+        let Some(client) = self.client.clone() else {
+            return;
         };
-
-        // Stop any existing streams
-        self.stop_streaming();
-
-        // Create aggregated channel
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
-        self.stream_tx = Some(tx.clone());
-        self.stream_rx = Some(rx);
+        let tx = match &self.stream_tx {
+            Some(tx) if self.stream_rx.is_some() => tx.clone(),
+            _ => {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                self.stream_tx = Some(tx.clone());
+                self.stream_rx = Some(rx);
+                tx
+            }
+        };
         self.streaming = true;
 
-        // Spawn stream tasks for each active service
-        for service in &self.services {
-            if !service.active {
-                continue;
-            }
-
-            let service_id = service.id.clone();
-            let client = client.clone();
-            let tx = tx.clone();
-            let tail_lines = self.tail_lines;
-
-            tokio::spawn(async move {
-                match client.logs_stream(&service_id, tail_lines).await {
-                    Ok(mut stream_rx) => {
-                        while let Some(line) = stream_rx.recv().await {
-                            if tx.send((service_id.clone(), line)).is_err() {
-                                // Channel closed, stop this stream
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to start log stream for {}: {}", service_id, e);
-                    }
+        let mut wanted = Vec::new();
+        for (ni, node) in self.nodes.iter().enumerate().filter(|(_, n)| n.active) {
+            for service in self.services.iter().filter(|s| s.active) {
+                let key = (ni, service.id.clone());
+                if node.runs(&service.id) && !self.streams.contains_key(&key) {
+                    wanted.push((key, node.ip.clone()));
                 }
-            });
+            }
+        }
+        for (key, ip) in wanted {
+            // A restart only asks for new lines; the old ones are shown
+            let tail = if self.started.contains(&key) {
+                0
+            } else {
+                self.tail_lines
+            };
+            let task = tokio::spawn(stream_task(
+                client.with_node(&ip),
+                key.0,
+                key.1.clone(),
+                tail,
+                tx.clone(),
+            ));
+            self.started.insert(key.clone());
+            self.streams.insert(key, (task, StreamStatus::Waiting));
         }
     }
 
     /// Stop all log streams
     pub fn stop_streaming(&mut self) {
         self.streaming = false;
+        for (task, _) in self.streams.values() {
+            task.abort();
+        }
+        self.streams.clear();
         self.stream_tx = None;
         self.stream_rx = None;
     }
@@ -442,7 +592,7 @@ impl MultiLogsComponent {
     /// Process incoming streamed log entries (call on tick)
     fn process_stream_entries(&mut self) {
         // First, drain the channel into a local vec to avoid borrow issues
-        let raw_lines: Vec<(String, String)> = {
+        let events: Vec<StreamEvent> = {
             let rx = match &mut self.stream_rx {
                 Some(r) => r,
                 None => return,
@@ -477,18 +627,48 @@ impl MultiLogsComponent {
             lines
         };
 
-        if raw_lines.is_empty() {
+        if events.is_empty() {
             return;
+        }
+        // Something answered: no longer "Loading"
+        if self.state.is_loading() {
+            self.state.mark_loaded();
         }
 
         // Now parse entries (can access self freely)
-        let new_entries: Vec<MultiLogEntry> = raw_lines
-            .into_iter()
-            .map(|(service_id, line)| {
-                let color = self.get_service_color(&service_id);
-                Self::parse_line(&line, &service_id, color)
-            })
-            .collect();
+        let mut new_entries: Vec<MultiLogEntry> = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                StreamEvent::Line {
+                    node,
+                    service,
+                    line,
+                } => {
+                    let color = self.get_service_color(&service);
+                    let mut entry = Self::parse_line(&line, &service, color);
+                    entry.node = node;
+                    if let Some(n) = self.nodes.get(node)
+                        && self.nodes.len() > 1
+                    {
+                        entry.search_text =
+                            format!("{} {}", n.name.to_lowercase(), entry.search_text);
+                    }
+                    new_entries.push(entry);
+                }
+                StreamEvent::Status {
+                    node,
+                    service,
+                    status,
+                } => {
+                    if let Some((_, current)) = self.streams.get_mut(&(node, service)) {
+                        *current = status;
+                    }
+                }
+            }
+        }
+        if new_entries.is_empty() {
+            return;
+        }
 
         // Get data and add new entries
         let Some(data) = self.data_mut() else { return };
@@ -526,7 +706,7 @@ impl MultiLogsComponent {
     /// Level counts show entries filtered by active services (so you see relevant breakdown)
     fn update_counts(&mut self) {
         // Compute counts from entries, then release borrow before mutating services/levels
-        let (service_counts, level_counts): (Vec<_>, Vec<_>) = {
+        let (service_counts, level_counts, node_counts): (Vec<_>, Vec<_>, Vec<_>) = {
             let Some(data) = self.data() else { return };
             let entries = &data.entries;
 
@@ -558,7 +738,11 @@ impl MultiLogsComponent {
                 })
                 .collect();
 
-            (service_counts, level_counts)
+            let node_counts: Vec<_> = (0..self.nodes.len())
+                .map(|ni| entries.iter().filter(|e| e.node == ni).count())
+                .collect();
+
+            (service_counts, level_counts, node_counts)
         };
 
         // Now apply the counts
@@ -567,6 +751,9 @@ impl MultiLogsComponent {
         }
         for (level, count) in self.levels.iter_mut().zip(level_counts) {
             level.entry_count = count;
+        }
+        for (node, count) in self.nodes.iter_mut().zip(node_counts) {
+            node.entry_count = count;
         }
     }
 
@@ -628,11 +815,27 @@ impl MultiLogsComponent {
         let line = line.trim();
         let search_text = line.to_lowercase();
 
+        if service_id == KERNEL_SERVICE
+            && let Some((ts, level, message)) = parse_kernel_line(line)
+        {
+            return MultiLogEntry {
+                node: 0,
+                service_id: service_id.to_string(),
+                service_color: color,
+                timestamp: Self::extract_time_part(ts),
+                timestamp_sort: Self::time_to_sort_key(ts),
+                level,
+                message,
+                search_text,
+            };
+        }
+
         let (timestamp, timestamp_sort, rest) = Self::extract_timestamp(line);
         let level = LogLevel::from_str(rest);
         let message = Self::clean_message(rest);
 
         MultiLogEntry {
+            node: 0,
             service_id: service_id.to_string(),
             service_color: color,
             timestamp,
@@ -1005,6 +1208,8 @@ impl MultiLogsComponent {
             .map(|l| l.level)
             .collect();
 
+        let active_nodes: Vec<bool> = self.nodes.iter().map(|n| n.active).collect();
+
         let total = {
             let Some(data) = self.data_mut() else { return };
 
@@ -1013,7 +1218,9 @@ impl MultiLogsComponent {
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| {
-                    active_services.contains(&e.service_id) && active_levels.contains(&e.level)
+                    active_services.contains(&e.service_id)
+                        && active_levels.contains(&e.level)
+                        && active_nodes.get(e.node).copied().unwrap_or(true)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -1061,6 +1268,9 @@ impl MultiLogsComponent {
         }
         self.update_counts();
         self.rebuild_visible_indices();
+        if self.streaming {
+            self.start_streaming();
+        }
     }
 
     /// Set all services inactive
@@ -1075,6 +1285,34 @@ impl MultiLogsComponent {
     /// Count active services
     fn active_count(&self) -> usize {
         self.services.iter().filter(|s| s.active).count()
+    }
+
+    /// Show or hide a node's lines; showing one starts its streams
+    fn toggle_node(&mut self, index: usize) {
+        let Some(node) = self.nodes.get_mut(index) else {
+            return;
+        };
+        node.active = !node.active;
+        let start = node.active && self.streaming;
+        self.rebuild_visible_indices();
+        if start {
+            self.start_streaming();
+        }
+    }
+
+    /// Show or hide every node
+    fn set_all_nodes(&mut self, active: bool) {
+        for node in &mut self.nodes {
+            node.active = active;
+        }
+        self.rebuild_visible_indices();
+        if active && self.streaming {
+            self.start_streaming();
+        }
+    }
+
+    fn active_node_count(&self) -> usize {
+        self.nodes.iter().filter(|n| n.active).count()
     }
 
     /// Toggle level active state
@@ -1178,15 +1416,20 @@ impl MultiLogsComponent {
     }
 
     /// Format a log entry as a string
-    fn format_entry(entry: &MultiLogEntry) -> String {
+    fn format_entry(&self, entry: &MultiLogEntry) -> String {
         let ts = if entry.timestamp.is_empty() {
             "NO TIME"
         } else {
             &entry.timestamp
         };
+        let node = match self.nodes.get(entry.node) {
+            Some(n) if self.multi_node() => format!("{} ", n.name),
+            _ => String::new(),
+        };
         format!(
-            "{} {} {} {}",
+            "{} {}{} {} {}",
             ts,
+            node,
             entry.service_id,
             entry.level.badge(),
             entry.message
@@ -1206,13 +1449,13 @@ impl MultiLogsComponent {
                     data.visible_indices
                         .get(vi)
                         .and_then(|&i| data.entries.get(i))
-                        .map(Self::format_entry)
+                        .map(|e| self.format_entry(e))
                 })
                 .collect()
         } else {
             // Yank current line only
             self.current_entry()
-                .map(|e| vec![Self::format_entry(e)])
+                .map(|e| vec![self.format_entry(e)])
                 .unwrap_or_default()
         };
 
@@ -1467,11 +1710,67 @@ impl MultiLogsComponent {
         frame.render_stateful_widget(list, panel_area, &mut self.levels_state);
     }
 
+    /// Draw the nodes filter panel, with each node's stream problems
+    fn draw_nodes_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let items: Vec<ListItem> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(ni, n)| {
+                let indicator = if n.active { "●" } else { "○" };
+                let style = Style::default().fg(n.color);
+                let mut spans = vec![
+                    Span::styled(indicator, style),
+                    Span::raw(" "),
+                    Span::styled(n.name.clone(), style),
+                    Span::raw(format!(" ({})", n.entry_count)).dim(),
+                ];
+                let failures = self.node_failures(ni);
+                if !failures.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  ✗ {}", failures.join("; ")),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let panel_width = (area.width.saturating_sub(4)).min(100);
+        let panel_height = (self.nodes.len() + 2).min(area.height as usize - 2) as u16;
+        let panel_area = Rect::new(area.x + 1, area.y, panel_width, panel_height);
+        frame.render_widget(ratatui::widgets::Clear, panel_area);
+
+        let border_style = Style::default().fg(Color::Cyan);
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .title("─ Nodes ")
+                    .title_style(border_style)
+                    .borders(Borders::ALL)
+                    .border_style(border_style),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        frame.render_stateful_widget(list, panel_area, &mut self.nodes_state);
+    }
+
     /// Draw the logs area
     fn draw_logs(&self, frame: &mut Frame, area: Rect) {
         if self.state.is_loading() {
-            let loading = Paragraph::new(Line::from(Span::raw(" Loading logs...").dim()));
-            frame.render_widget(loading, area);
+            let (_, waiting, failed) = self.stream_counts();
+            let mut lines = vec![Line::from(
+                Span::raw(format!(" Waiting for logs ({waiting} streams)...")).dim(),
+            )];
+            if failed > 0 {
+                for (ni, node) in self.nodes.iter().enumerate() {
+                    for failure in self.node_failures(ni) {
+                        lines.push(Line::from(
+                            Span::raw(format!(" {}: {failure}", node.name)).fg(Color::Red),
+                        ));
+                    }
+                }
+            }
+            frame.render_widget(Paragraph::new(lines), area);
             return;
         }
 
@@ -1557,6 +1856,18 @@ impl MultiLogsComponent {
             }
             spans.push(Span::raw(" "));
 
+            // Node name (colored, fixed width) when streaming several
+            let node_width = self.node_column_width();
+            if node_width > 0
+                && let Some(node) = self.nodes.get(entry.node)
+            {
+                let name: String = node.name.chars().take(node_width).collect();
+                spans.push(Span::styled(
+                    format!("{name:<node_width$} "),
+                    Style::default().fg(node.color),
+                ));
+            }
+
             // Service name (colored, fixed width)
             spans.push(Span::styled(
                 format!("{:<12}", entry.service_id),
@@ -1573,7 +1884,9 @@ impl MultiLogsComponent {
             spans.push(Span::raw(" "));
 
             // Message with optional highlighting
-            let prefix_width = 1 + 8 + 1 + 12 + 1 + 3 + 1; // indicator + time + service + level
+            // indicator + time + node + service + level
+            let node_prefix = if node_width > 0 { node_width + 1 } else { 0 };
+            let prefix_width = 1 + 8 + 1 + node_prefix + 12 + 1 + 3 + 1;
             let available = content_width.saturating_sub(prefix_width);
 
             if self.wrap && entry.message.len() > available {
@@ -1655,6 +1968,116 @@ impl MultiLogsComponent {
     }
 }
 
+/// Stream one service (or the kernel log) of one node into `tx` until the
+/// stream ends or the task is aborted. `tail` lines of history come first.
+async fn stream_task(
+    client: talos_rs::TalosClient,
+    node: usize,
+    service: String,
+    tail: i32,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+) {
+    let status = |status| StreamEvent::Status {
+        node,
+        service: service.clone(),
+        status,
+    };
+    let line = |line| StreamEvent::Line {
+        node,
+        service: service.clone(),
+        line,
+    };
+
+    // The kernel stream gives the whole ring buffer or only new lines, so
+    // the history is a separate, bounded read of its last `tail` lines
+    let mut last_history = None;
+    if service == KERNEL_SERVICE && tail > 0 {
+        let history = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.dmesg(false, false),
+        )
+        .await;
+        match history {
+            Ok(Ok(text)) => {
+                let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                let skip = lines.len().saturating_sub(tail as usize);
+                if !lines.is_empty() {
+                    let _ = tx.send(status(StreamStatus::Streaming));
+                }
+                for l in &lines[skip..] {
+                    if tx.send(line(l.to_string())).is_err() {
+                        return;
+                    }
+                }
+                last_history = lines.last().map(|l| l.to_string());
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(status(StreamStatus::Failed(e.to_string())));
+                return;
+            }
+            Err(_) => {
+                let _ = tx.send(status(StreamStatus::Failed(
+                    "timed out reading the kernel log".to_string(),
+                )));
+                return;
+            }
+        }
+    }
+
+    let stream = if service == KERNEL_SERVICE {
+        client.dmesg_stream(true).await
+    } else {
+        client.logs_stream(&service, tail).await
+    };
+    let mut rx = match stream {
+        Ok(rx) => rx,
+        Err(e) => {
+            let _ = tx.send(status(StreamStatus::Failed(
+                talos_pilot_core::format_talos_error(&e),
+            )));
+            return;
+        }
+    };
+    let mut first = true;
+    while let Some(text) = rx.recv().await {
+        if first {
+            first = false;
+            let _ = tx.send(status(StreamStatus::Streaming));
+            // The follow stream may repeat the line the history ended with
+            if last_history.as_deref() == Some(text.as_str()) {
+                continue;
+            }
+        }
+        if tx.send(line(text)).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(status(StreamStatus::Ended));
+}
+
+/// Split a Talos kernel log line, `kern:    info: [2026-10-19T08:20:59.58Z]: text`,
+/// into its timestamp, level and message (prefixed with the facility when it
+/// isn't `kern`)
+fn parse_kernel_line(line: &str) -> Option<(&str, LogLevel, String)> {
+    let (facility, rest) = line.split_once(':')?;
+    let (priority, rest) = rest.split_once(':')?;
+    let rest = rest.trim_start().strip_prefix('[')?;
+    let (ts, message) = rest.split_once("]:")?;
+    let level = match priority.trim() {
+        "emerg" | "alert" | "crit" | "err" => LogLevel::Error,
+        "warning" => LogLevel::Warn,
+        "notice" | "info" => LogLevel::Info,
+        "debug" => LogLevel::Debug,
+        _ => LogLevel::Unknown,
+    };
+    let message = message.trim();
+    let message = match facility.trim() {
+        "kern" => message.to_string(),
+        other => format!("{other}: {message}"),
+    };
+    Some((ts, level, message))
+}
+
 impl Component for MultiLogsComponent {
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
         // Handle search input mode
@@ -1712,7 +2135,8 @@ impl Component for MultiLogsComponent {
             KeyCode::Tab => {
                 self.floating_pane = match self.floating_pane {
                     FloatingPane::Services => FloatingPane::Levels,
-                    FloatingPane::Levels => FloatingPane::Services,
+                    FloatingPane::Levels if self.multi_node() => FloatingPane::Nodes,
+                    FloatingPane::Levels | FloatingPane::Nodes => FloatingPane::Services,
                     FloatingPane::None => FloatingPane::Services,
                 };
                 Ok(None)
@@ -1724,6 +2148,14 @@ impl Component for MultiLogsComponent {
                     FloatingPane::None
                 } else {
                     FloatingPane::Services
+                };
+                Ok(None)
+            }
+            KeyCode::Char('o') if self.multi_node() => {
+                self.floating_pane = if self.floating_pane == FloatingPane::Nodes {
+                    FloatingPane::None
+                } else {
+                    FloatingPane::Nodes
                 };
                 Ok(None)
             }
@@ -1746,6 +2178,10 @@ impl Component for MultiLogsComponent {
                     FloatingPane::Levels => {
                         self.selected_level = self.selected_level.saturating_sub(1);
                         self.levels_state.select(Some(self.selected_level));
+                    }
+                    FloatingPane::Nodes => {
+                        self.selected_node = self.selected_node.saturating_sub(1);
+                        self.nodes_state.select(Some(self.selected_node));
                     }
                     FloatingPane::None => {
                         // Always move cursor up
@@ -1770,6 +2206,11 @@ impl Component for MultiLogsComponent {
                         self.selected_level =
                             (self.selected_level + 1).min(self.levels.len().saturating_sub(1));
                         self.levels_state.select(Some(self.selected_level));
+                    }
+                    FloatingPane::Nodes => {
+                        self.selected_node =
+                            (self.selected_node + 1).min(self.nodes.len().saturating_sub(1));
+                        self.nodes_state.select(Some(self.selected_node));
                     }
                     FloatingPane::None => {
                         // Always move cursor down
@@ -1869,6 +2310,7 @@ impl Component for MultiLogsComponent {
                 match self.floating_pane {
                     FloatingPane::Services => self.toggle_service(self.selected_service),
                     FloatingPane::Levels => self.toggle_level(self.selected_level),
+                    FloatingPane::Nodes => self.toggle_node(self.selected_node),
                     FloatingPane::None => {}
                 }
                 Ok(None)
@@ -1877,6 +2319,7 @@ impl Component for MultiLogsComponent {
                 match self.floating_pane {
                     FloatingPane::Services => self.activate_all(),
                     FloatingPane::Levels => self.activate_all_levels(),
+                    FloatingPane::Nodes => self.set_all_nodes(true),
                     FloatingPane::None => {}
                 }
                 Ok(None)
@@ -1898,6 +2341,7 @@ impl Component for MultiLogsComponent {
                     match self.floating_pane {
                         FloatingPane::Services => self.deactivate_all(),
                         FloatingPane::Levels => self.deactivate_all_levels(),
+                        FloatingPane::Nodes => self.set_all_nodes(false),
                         FloatingPane::None => {}
                     }
                 }
@@ -2012,14 +2456,25 @@ impl Component for MultiLogsComponent {
             Span::styled("○ PAUSED ", Style::default().fg(Color::DarkGray))
         };
 
+        let nodes = if self.multi_node() {
+            format!(", {}/{} nodes", self.active_node_count(), self.nodes.len())
+        } else {
+            String::new()
+        };
         let mut header_spans = vec![
-            Span::raw(" Multi-Service Logs: ").bold().fg(Color::Cyan),
-            Span::raw(&self.node_ip).fg(Color::White),
-            Span::raw(format!(" ({})", self.node_role)).dim(),
+            Span::raw(if self.multi_node() {
+                " Cluster Logs: "
+            } else {
+                " Multi-Service Logs: "
+            })
+            .bold()
+            .fg(Color::Cyan),
+            Span::raw(&self.title).fg(Color::White),
+            Span::raw(format!(" ({})", self.subtitle)).dim(),
             Span::raw("  "),
             follow_indicator,
             Span::raw(format!(
-                " [{}/{} svcs, {}/{} lvls]",
+                " [{}/{} svcs, {}/{} lvls{nodes}]",
                 self.active_count(),
                 self.services.len(),
                 self.active_level_count(),
@@ -2027,6 +2482,17 @@ impl Component for MultiLogsComponent {
             ))
             .dim(),
         ];
+        let (_, waiting, failed) = self.stream_counts();
+        if failed > 0 {
+            let hint = if self.multi_node() { ", see [o]" } else { "" };
+            header_spans.push(Span::styled(
+                format!("  {failed} stream(s) failed{hint}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        if waiting > 0 && self.streaming {
+            header_spans.push(Span::raw(format!("  {waiting} waiting")).dim());
+        }
 
         // Show match count when searching
         if !self.match_order.is_empty() {
@@ -2073,6 +2539,7 @@ impl Component for MultiLogsComponent {
         match self.floating_pane {
             FloatingPane::Services => self.draw_services_panel(frame, content_area),
             FloatingPane::Levels => self.draw_levels_panel(frame, content_area),
+            FloatingPane::Nodes => self.draw_nodes_panel(frame, content_area),
             FloatingPane::None => {}
         }
 
@@ -2173,7 +2640,7 @@ impl Component for MultiLogsComponent {
         } else {
             let stream_text = if self.streaming { " stop" } else { " stream" };
             let wrap_text = if self.wrap { " nowrap" } else { " wrap" };
-            vec![
+            let mut spans = vec![
                 Span::raw(" [s]").fg(Color::Yellow),
                 Span::raw(" svcs").dim(),
                 Span::raw(" "),
@@ -2206,7 +2673,18 @@ impl Component for MultiLogsComponent {
                 Span::raw(" "),
                 Span::raw("[q]").fg(Color::Yellow),
                 Span::raw(" back").dim(),
-            ]
+            ];
+            if self.multi_node() {
+                spans.splice(
+                    3..3,
+                    [
+                        Span::raw("[o]").fg(Color::Yellow),
+                        Span::raw(" nodes").dim(),
+                        Span::raw(" "),
+                    ],
+                );
+            }
+            spans
         };
 
         let footer = Paragraph::new(Line::from(footer_spans)).block(
@@ -2226,6 +2704,247 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn node(name: &str) -> LogNode {
+        LogNode {
+            name: name.to_string(),
+            ip: format!("10.0.0.{}", name.len()),
+            services: Some(vec!["etcd".to_string()]),
+        }
+    }
+
+    /// A cluster view of etcd and the kernel on three nodes, fed lines as
+    /// the stream tasks would send them
+    fn cluster_logs(lines: &[(usize, &str, &str)]) -> MultiLogsComponent {
+        let mut logs = MultiLogsComponent::new(
+            "bc control plane".into(),
+            "3 nodes".into(),
+            vec![node("bc1"), node("bc2"), node("bc3")],
+            vec!["etcd".into(), KERNEL_SERVICE.into()],
+            vec!["etcd".into(), KERNEL_SERVICE.into()],
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        logs.stream_tx = Some(tx.clone());
+        logs.stream_rx = Some(rx);
+        logs.streaming = true;
+        for (node, service, line) in lines {
+            tx.send(StreamEvent::Line {
+                node: *node,
+                service: service.to_string(),
+                line: line.to_string(),
+            })
+            .unwrap();
+        }
+        logs.update(Action::Tick).unwrap();
+        logs
+    }
+
+    fn render(logs: &mut MultiLogsComponent) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(140, 14)).unwrap();
+        terminal.draw(|f| logs.draw(f, f.area()).unwrap()).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Streams etcd and the kernel log from bc's nodes for a few seconds:
+    /// `cargo test --lib live_cluster_logs -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_cluster_logs() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context =
+            std::env::var("TALOS_PILOT_LIVE_CONTEXT").unwrap_or_else(|_| "bc".to_string());
+        let ips: Vec<String> = std::env::var("TALOS_PILOT_LIVE_NODES")
+            .expect("set TALOS_PILOT_LIVE_NODES=ip,ip,...")
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let client = talos_rs::TalosClient::from_named_context(&context)
+            .await
+            .unwrap();
+        let nodes = ips
+            .iter()
+            .map(|ip| LogNode {
+                name: ip.clone(),
+                ip: ip.clone(),
+                services: None,
+            })
+            .collect();
+        let services = vec!["etcd".to_string(), KERNEL_SERVICE.to_string()];
+        let mut logs =
+            MultiLogsComponent::new(context, "live".into(), nodes, services.clone(), services);
+        logs.set_client(client, 20);
+        logs.start_streaming();
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            logs.update(Action::Tick).unwrap();
+        }
+        let data = logs.data().unwrap();
+        for (ni, n) in logs.nodes.iter().enumerate() {
+            let per: Vec<String> = ["etcd", KERNEL_SERVICE]
+                .iter()
+                .map(|svc| {
+                    let count = data
+                        .entries
+                        .iter()
+                        .filter(|e| e.node == ni && e.service_id == *svc)
+                        .count();
+                    let status = logs.streams.get(&(ni, svc.to_string())).map(|s| &s.1);
+                    format!("{svc}={count} {status:?}")
+                })
+                .collect();
+            println!("{}: {}", n.name, per.join(", "));
+        }
+        let mut kernel = data
+            .entries
+            .iter()
+            .filter(|e| e.service_id == KERNEL_SERVICE);
+        let no_time = kernel.clone().filter(|e| e.timestamp.is_empty()).count();
+        println!("kernel entries without a time: {no_time}");
+        if let Some(e) = kernel.next_back() {
+            println!("last kernel: {} {:?} {}", e.timestamp, e.level, e.message);
+        }
+        let sorted = data
+            .entries
+            .windows(2)
+            .all(|w| w[0].timestamp_sort <= w[1].timestamp_sort);
+        println!("sorted: {sorted}, total {}", data.entries.len());
+        logs.stop_streaming();
+    }
+
+    #[test]
+    fn parses_kernel_lines() {
+        let (ts, level, message) = parse_kernel_line(
+            "kern:    info: [2026-10-19T08:20:59.588932729Z]: drbd pvc-1 bc2: conn( Connecting -> Connected )",
+        )
+        .unwrap();
+        assert_eq!(ts, "2026-10-19T08:20:59.588932729Z");
+        assert_eq!(level, LogLevel::Info);
+        assert_eq!(message, "drbd pvc-1 bc2: conn( Connecting -> Connected )");
+
+        let (_, level, message) =
+            parse_kernel_line("daemon: warning: [2026-10-19T08:21:00Z]: low on entropy").unwrap();
+        assert_eq!(level, LogLevel::Warn);
+        assert_eq!(message, "daemon: low on entropy");
+        let (_, level, _) =
+            parse_kernel_line("kern:     err: [2026-10-19T08:21:00Z]: I/O error").unwrap();
+        assert_eq!(level, LogLevel::Error);
+        assert!(parse_kernel_line("not a kernel line").is_none());
+
+        let entry = MultiLogsComponent::parse_line(
+            "kern:    info: [2026-10-19T08:20:59.588932729Z]: eth0: renamed",
+            KERNEL_SERVICE,
+            Color::White,
+        );
+        assert_eq!(entry.timestamp, "08:20:59");
+        assert_eq!(entry.message, "eth0: renamed");
+    }
+
+    #[tokio::test]
+    async fn merges_nodes_by_time_with_a_node_column() {
+        let mut logs = cluster_logs(&[
+            (
+                1,
+                "etcd",
+                r#"{"level":"warn","ts":"2026-10-19T08:20:02.000Z","msg":"slow apply"}"#,
+            ),
+            (
+                0,
+                "etcd",
+                r#"{"level":"info","ts":"2026-10-19T08:20:01.000Z","msg":"leader changed"}"#,
+            ),
+            (
+                2,
+                KERNEL_SERVICE,
+                "kern:    info: [2026-10-19T08:20:03.000Z]: drbd link up",
+            ),
+        ]);
+        let screen = render(&mut logs);
+        assert!(
+            screen.contains("Cluster Logs: bc control plane"),
+            "{screen}"
+        );
+        assert!(screen.contains("3/3 nodes"), "{screen}");
+        let positions: Vec<usize> = ["leader changed", "slow apply", "drbd link up"]
+            .iter()
+            .map(|m| screen.find(m).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{screen}");
+        assert!(screen.contains("bc1 etcd"), "{screen}");
+        assert!(screen.contains("bc3 kernel"), "{screen}");
+        assert!(screen.contains("[o]"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn nodes_pane_hides_a_nodes_lines_and_shows_failures() {
+        let mut logs = cluster_logs(&[
+            (
+                0,
+                "etcd",
+                r#"{"level":"info","ts":"2026-10-19T08:20:01.000Z","msg":"from bc1"}"#,
+            ),
+            (
+                1,
+                "etcd",
+                r#"{"level":"info","ts":"2026-10-19T08:20:02.000Z","msg":"from bc2"}"#,
+            ),
+        ]);
+        // bc3's stream failed
+        let tx = logs.stream_tx.clone().unwrap();
+        logs.streams.insert(
+            (2, "etcd".to_string()),
+            (tokio::spawn(async {}), StreamStatus::Waiting),
+        );
+        tx.send(StreamEvent::Status {
+            node: 2,
+            service: "etcd".to_string(),
+            status: StreamStatus::Failed("node unreachable".to_string()),
+        })
+        .unwrap();
+        logs.update(Action::Tick).unwrap();
+
+        for code in [KeyCode::Char('o'), KeyCode::Char('j'), KeyCode::Char(' ')] {
+            logs.handle_key_event(key(code, KeyModifiers::NONE))
+                .unwrap();
+        }
+        let screen = render(&mut logs);
+        assert!(screen.contains("2/3 nodes"), "{screen}");
+        assert!(screen.contains("1 stream(s) failed"), "{screen}");
+        assert!(screen.contains("✗ etcd: node unreachable"), "{screen}");
+        logs.handle_key_event(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        let screen = render(&mut logs);
+        assert!(screen.contains("from bc1"), "{screen}");
+        assert!(!screen.contains("from bc2"), "{screen}");
+    }
+
+    #[test]
+    fn a_single_node_has_no_node_column() {
+        let mut logs = MultiLogsComponent::new(
+            "10.0.0.1".into(),
+            "worker".into(),
+            vec![node("w1")],
+            vec!["kubelet".into()],
+            vec!["kubelet".into()],
+        );
+        logs.set_logs(vec![(
+            "kubelet".to_string(),
+            r#"{"level":"info","ts":"2026-10-19T08:20:01.000Z","msg":"synced"}"#.to_string(),
+        )]);
+        let screen = render(&mut logs);
+        assert!(screen.contains("Multi-Service Logs: 10.0.0.1"), "{screen}");
+        assert!(screen.contains("synced"), "{screen}");
+        assert!(!screen.contains("w1 "), "{screen}");
+        assert!(!screen.contains("[o]"), "{screen}");
     }
 
     #[test]
@@ -2248,6 +2967,7 @@ mod tests {
         let mut logs = MultiLogsComponent::new(
             "10.0.0.1".into(),
             "worker".into(),
+            vec![node("w1")],
             vec!["kubelet".into()],
             vec!["kubelet".into()],
         );
@@ -2264,6 +2984,7 @@ mod tests {
         let mut reopened = MultiLogsComponent::new(
             "10.0.0.1".into(),
             "worker".into(),
+            vec![node("w1")],
             vec!["kubelet".into()],
             vec!["kubelet".into()],
         );

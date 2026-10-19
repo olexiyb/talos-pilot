@@ -28,7 +28,7 @@ Talos Linux removes SSH access for security, replacing it with an API-driven man
 
 - **Interactive cluster overview** - See all nodes, services, and health at a glance
 - **Real-time monitoring** - CPU, memory, network stats with auto-refresh
-- **Unified log viewer** - Stream logs from multiple services simultaneously (Stern-style)
+- **Unified log viewer** - Stream logs from multiple services simultaneously (Stern-style), on one node or across a cluster's nodes, with the kernel log (dmesg)
 - **Production operations** - Drain, reboot, rolling upgrades with safety checks
 - **Diagnostics** - Automated health checks with actionable fix suggestions
 
@@ -60,6 +60,7 @@ Use **talos-pilot** for "why won't my node join the cluster?"
 |---------|-------------|
 | **Service Logs** | Scrollable, searchable (`/`), color-coded by level |
 | **Multi-Service Logs** | Stern-style interleaved logs from multiple services |
+| **Cluster Logs** | `l` on a cluster, control plane or workers row: the same services from every node, merged by time with a node column; `o` filters nodes and shows streams that failed. The `kernel` service streams dmesg |
 | **Processes View** | htop-like process list with tree view, CPU/MEM sorting |
 | **Network Stats** | Interface traffic, connections, KubeSpan peers, packet capture |
 | **Storage/Disks** | Disk list with size, transport, serial, system disk indicators |

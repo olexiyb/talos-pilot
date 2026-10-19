@@ -2,7 +2,7 @@
 
 use crate::action::Action;
 use crate::components::diagnostics::k8s;
-use crate::components::{Component, ProcessNode};
+use crate::components::{Component, KERNEL_SERVICE, LogNode, ProcessNode};
 use crate::linstor::{LinstorNode, LinstorStatus, StoragePool, fetch_linstor};
 use crate::reachability::prefer_reachable_addresses;
 use crate::zfs::{ZfsPool, fetch_zfs_pools};
@@ -1294,6 +1294,77 @@ impl ClusterComponent {
         }
     }
 
+    /// Logs view for the selection: one node's services, or the nodes of a
+    /// cluster / control plane / workers group streamed together. A group
+    /// starts with etcd (control plane) or kubelet; the rest are a toggle
+    /// away, and the kernel log is offered too.
+    fn logs_action(&self, only_service: Option<String>) -> Option<Action> {
+        let (cluster_idx, names) = self.selected_nodes()?;
+        let cluster = self.clusters.get(cluster_idx)?;
+        let nodes: Vec<LogNode> = names
+            .iter()
+            .map(|name| LogNode {
+                name: name.clone(),
+                ip: cluster
+                    .node_ips
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone()),
+                services: self
+                    .get_node_services_for(cluster_idx, name)
+                    .map(|services| services.iter().map(|s| s.id.clone()).collect()),
+            })
+            .collect();
+        // Services of the nodes, in first-seen order
+        let mut all_services: Vec<String> = Vec::new();
+        for service in nodes.iter().flat_map(|n| n.services.iter().flatten()) {
+            if !all_services.contains(service) {
+                all_services.push(service.clone());
+            }
+        }
+
+        let single = matches!(
+            self.selected_item,
+            NodeListItem::ControlPlaneNode(..) | NodeListItem::WorkerNode(..)
+        );
+        let (title, subtitle, active) = if single {
+            if all_services.is_empty() {
+                return None;
+            }
+            let node = nodes.first()?;
+            let active = only_service.map_or_else(|| all_services.clone(), |s| vec![s]);
+            (node.ip.clone(), self.current_node_role(), active)
+        } else {
+            if nodes.is_empty() {
+                return None;
+            }
+            let title = match self.selected_item {
+                NodeListItem::ControlPlaneHeader(_) => format!("{} control plane", cluster.name),
+                NodeListItem::WorkersHeader(_) => format!("{} workers", cluster.name),
+                _ => cluster.name.clone(),
+            };
+            let control_plane = matches!(self.selected_item, NodeListItem::ControlPlaneHeader(_));
+            let preferred = if control_plane { "etcd" } else { "kubelet" };
+            let first = if all_services.iter().any(|s| s == preferred) {
+                preferred.to_string()
+            } else {
+                all_services
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| KERNEL_SERVICE.to_string())
+            };
+            (title, format!("{} nodes", nodes.len()), vec![first])
+        };
+        all_services.push(KERNEL_SERVICE.to_string());
+        Some(Action::ShowMultiLogs(
+            title,
+            subtitle,
+            nodes,
+            active,
+            all_services,
+        ))
+    }
+
     /// Talos address of every node in the active cluster, by node name
     pub fn active_node_ips(&self) -> HashMap<String, String> {
         self.node_ips().clone()
@@ -2162,30 +2233,7 @@ impl ClusterComponent {
         }
         let menu_item = NavMenuItem::ALL[self.selected_menu_item - 1];
         match menu_item {
-            NavMenuItem::Logs => {
-                // Show all logs for selected node
-                if let Some(node_name) = self.current_node_name() {
-                    let service_ids = self.current_service_ids();
-                    if !service_ids.is_empty() {
-                        let node_role = self.current_node_role();
-                        let node_ip = self
-                            .node_ips()
-                            .get(&node_name)
-                            .cloned()
-                            .unwrap_or(node_name.clone());
-                        Ok(Some(Action::ShowMultiLogs(
-                            node_ip,
-                            node_role,
-                            service_ids.clone(),
-                            service_ids,
-                        )))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    Ok(None)
-                }
-            }
+            NavMenuItem::Logs => Ok(self.logs_action(None)),
             NavMenuItem::Etcd => Ok(Some(Action::ShowEtcd)),
             NavMenuItem::Network => {
                 if let Some(node_name) = self.current_node_name() {
@@ -2423,29 +2471,7 @@ impl Component for ClusterComponent {
                                 self.toggle_expand();
                                 Ok(None)
                             }
-                            _ => {
-                                if let Some(node_name) = self.current_node_name() {
-                                    let service_ids = self.current_service_ids();
-                                    if !service_ids.is_empty() {
-                                        let node_role = self.current_node_role();
-                                        let node_ip = self
-                                            .node_ips()
-                                            .get(&node_name)
-                                            .cloned()
-                                            .unwrap_or(node_name.clone());
-                                        Ok(Some(Action::ShowMultiLogs(
-                                            node_ip,
-                                            node_role,
-                                            service_ids.clone(),
-                                            service_ids,
-                                        )))
-                                    } else {
-                                        Ok(None)
-                                    }
-                                } else {
-                                    Ok(None)
-                                }
-                            }
+                            _ => Ok(self.logs_action(None)),
                         }
                     }
                     FocusedPane::Menu => {
@@ -2453,56 +2479,17 @@ impl Component for ClusterComponent {
                         self.navigate_to_selected_menu()
                     }
                     FocusedPane::Services => {
-                        // Show logs for selected service (but include all services as available)
-                        if let Some(node_name) = self.current_node_name() {
-                            if let Some(service_id) = self.selected_service_id() {
-                                let node_role = self.current_node_role();
-                                let all_services = self.current_service_ids();
-                                let node_ip = self
-                                    .node_ips()
-                                    .get(&node_name)
-                                    .cloned()
-                                    .unwrap_or(node_name.clone());
-                                Ok(Some(Action::ShowMultiLogs(
-                                    node_ip,
-                                    node_role,
-                                    vec![service_id],
-                                    all_services,
-                                )))
-                            } else {
-                                Ok(None)
-                            }
-                        } else {
-                            Ok(None)
-                        }
+                        // Logs of the selected service, the node's others available
+                        Ok(self
+                            .selected_service_id()
+                            .and_then(|id| self.logs_action(Some(id))))
                     }
                 }
             }
 
-            // 'l' / 'L' - show logs (all services for node)
-            KeyCode::Char('l') | KeyCode::Char('L') => {
-                if let Some(node_name) = self.current_node_name() {
-                    let service_ids = self.current_service_ids();
-                    if !service_ids.is_empty() {
-                        let node_role = self.current_node_role();
-                        let node_ip = self
-                            .node_ips()
-                            .get(&node_name)
-                            .cloned()
-                            .unwrap_or(node_name.clone());
-                        Ok(Some(Action::ShowMultiLogs(
-                            node_ip,
-                            node_role,
-                            service_ids.clone(),
-                            service_ids,
-                        )))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    Ok(None)
-                }
-            }
+            // 'l' / 'L' - logs of the selected node, or of the selected
+            // cluster / control plane / workers across their nodes
+            KeyCode::Char('l') | KeyCode::Char('L') => Ok(self.logs_action(None)),
 
             // Direct hotkeys for screens (always work)
             KeyCode::Char('e') => Ok(Some(Action::ShowEtcd)),
