@@ -16,6 +16,7 @@
 
 use crate::action::Action;
 use crate::components::Component;
+use crate::components::diagnostics::k8s::KubeconfigSource;
 use crate::linstor_volumes::{
     Issue, LinstorVolume, Remedy, Replica, SatellitePod, Severity, apply_mounts, fetch_mounts,
     fetch_satellites, fetch_volumes, format_kib, linstor_mount_nodes, observe_drbd, remediation,
@@ -151,16 +152,34 @@ impl VolumeRow {
     }
 }
 
+/// `kubectl` pinned to the kubeconfig context the view's Kubernetes client
+/// uses, so a copied command can't act on whatever cluster is current. When
+/// the kubeconfig came from a Talos node, no local context has this cluster's
+/// CA (one with the same name is another cluster), so the context is left as
+/// a placeholder to fill in.
+fn kubectl_for(source: Option<&KubeconfigSource>, talos_context: Option<&str>) -> String {
+    match source {
+        Some(KubeconfigSource::Environment(Some(context))) => {
+            format!("kubectl --context {context}")
+        }
+        _ => format!(
+            "kubectl --context <context for {}>",
+            talos_context.unwrap_or("this cluster")
+        ),
+    }
+}
+
 /// Deleting an orphaned volume: its PV first, if it still has one, then the
 /// volume itself, which destroys the data
 fn orphan_remedy(
     row: &VolumeRow,
     orphan: &Orphan,
     satellites: &HashMap<String, SatellitePod>,
+    kubectl: &str,
 ) -> Remedy {
     let mut commands: Vec<String> = orphan
         .pv()
-        .map(|pv| format!("kubectl delete pv {pv}"))
+        .map(|pv| format!("{kubectl} delete pv {pv}"))
         .into_iter()
         .collect();
     let size = row
@@ -175,7 +194,7 @@ fn orphan_remedy(
                 .next()
                 .map_or("piraeus-datastore", |p| p.namespace.as_str());
             commands.push(format!(
-                "kubectl -n {namespace} exec deploy/linstor-controller -- \
+                "{kubectl} -n {namespace} exec deploy/linstor-controller -- \
                  linstor resource-definition delete {}",
                 v.resource
             ));
@@ -188,7 +207,7 @@ fn orphan_remedy(
         }
         Source::Zfs(v) => {
             commands.push(format!(
-                "kubectl -n {} delete zfsvolume {}",
+                "{kubectl} -n {} delete zfsvolume {}",
                 v.namespace, v.name
             ));
             format!(
@@ -267,6 +286,10 @@ pub struct VolumesComponent {
     k8s_client: Option<Client>,
     /// Talos client and control plane node to get a Kubernetes client from
     k8s_source: Option<(TalosClient, Option<String>)>,
+    /// Talos context of the cluster, to name it in a placeholder
+    talos_context: Option<String>,
+    /// `kubectl` pinned to the context reaching this cluster, for fix suggestions
+    kubectl: String,
     /// Talos client and node name -> address, for kernel state and mounts
     talos: Option<TalosClient>,
     node_ips: HashMap<String, String>,
@@ -299,6 +322,8 @@ impl VolumesComponent {
             scope: nodes.map(|n| n.into_iter().collect()),
             k8s_client: None,
             k8s_source: None,
+            talos_context: None,
+            kubectl: kubectl_for(None, None),
             talos: None,
             node_ips: HashMap::new(),
             show_all: true,
@@ -353,6 +378,12 @@ impl VolumesComponent {
         self.state.set_error(error);
     }
 
+    /// Talos context of the cluster shown
+    pub fn set_context(&mut self, context: Option<String>) {
+        self.kubectl = kubectl_for(None, context.as_deref());
+        self.talos_context = context;
+    }
+
     /// Scan the storage layers, the nodes' DRBD state and mounts
     pub async fn refresh(&mut self) -> Result<()> {
         self.state.start_loading();
@@ -370,7 +401,10 @@ impl VolumesComponent {
             )
             .await;
             match created {
-                Ok(Ok((client, _source))) => self.k8s_client = Some(client),
+                Ok(Ok((client, source))) => {
+                    self.kubectl = kubectl_for(Some(&source), self.talos_context.as_deref());
+                    self.k8s_client = Some(client);
+                }
                 Ok(Err(e)) => {
                     self.set_error(format!("Failed to connect to Kubernetes: {e}"));
                     return Ok(());
@@ -785,11 +819,11 @@ impl VolumesComponent {
             return Vec::new();
         };
         let mut remedies = match &row.source {
-            Source::Linstor(v) => remediation(v, &data.satellites),
+            Source::Linstor(v) => remediation(v, &data.satellites, &self.kubectl),
             Source::Zfs(_) => Vec::new(),
         };
         if let Some(orphan) = &row.orphan {
-            remedies.push(orphan_remedy(row, orphan, &data.satellites));
+            remedies.push(orphan_remedy(row, orphan, &data.satellites, &self.kubectl));
         }
         remedies
     }
@@ -1159,6 +1193,7 @@ impl crate::components::BackgroundRefresh for VolumesComponent {
         self.state = refreshed.state;
         // Including `None` after a failure, so the next refresh reconnects
         self.k8s_client = refreshed.k8s_client;
+        self.kubectl = refreshed.kubectl;
         if let Some(key) = selected
             && let Some(index) = self.visible().iter().position(|r| r.key() == key)
         {
@@ -1248,6 +1283,8 @@ mod tests {
             .collect();
         rows.push(VolumeRow::new(Source::Zfs(zfs), None));
         let mut c = VolumesComponent::new("bc".to_string(), None);
+        let matched = KubeconfigSource::Environment(Some("bc".to_string()));
+        c.kubectl = kubectl_for(Some(&matched), Some("bc"));
         c.state.set_data(VolumesData {
             installed: true,
             satellites: HashMap::new(),
@@ -1341,10 +1378,10 @@ mod tests {
         let row = VolumeRow::new(Source::Zfs(zfs), Some(&pvs));
         assert_eq!(row.orphan, Some(Orphan::NoPv));
         assert_eq!(row.issues.len(), 1);
-        let remedy = orphan_remedy(&row, &Orphan::NoPv, &HashMap::new());
+        let remedy = orphan_remedy(&row, &Orphan::NoPv, &HashMap::new(), "kubectl --context bc");
         assert_eq!(
             remedy.commands,
-            ["kubectl -n openebs delete zfsvolume pvc-gone"]
+            ["kubectl --context bc -n openebs delete zfsvolume pvc-gone"]
         );
         assert!(remedy.summary.contains("datapool/localpv/pvc-gone on bc2"));
 
@@ -1374,12 +1411,27 @@ mod tests {
             claim: Some("mon/grafana".to_string()),
         };
         let row = VolumeRow::new(Source::Linstor(csi), None);
-        let remedy = orphan_remedy(&row, &released, &HashMap::new());
+        let remedy = orphan_remedy(&row, &released, &HashMap::new(), "kubectl");
         assert_eq!(remedy.commands[0], "kubectl delete pv pvc-old");
         assert!(remedy.commands[1].starts_with(
             "kubectl -n piraeus-datastore exec deploy/linstor-controller -- \
              linstor resource-definition delete "
         ));
+    }
+
+    #[test]
+    fn kubectl_is_pinned_to_the_clusters_context() {
+        let matched = KubeconfigSource::Environment(Some("kprod".to_string()));
+        assert_eq!(
+            kubectl_for(Some(&matched), Some("kprod")),
+            "kubectl --context kprod"
+        );
+        // From a node: no local context is known to reach this cluster
+        let node = KubeconfigSource::TalosNode("10.0.0.1".to_string());
+        assert_eq!(
+            kubectl_for(Some(&node), Some("kprod")),
+            "kubectl --context <context for kprod>"
+        );
     }
 
     #[test]

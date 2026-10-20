@@ -27,8 +27,9 @@ pub enum K8sError {
 /// Source of the kubeconfig used to create the K8s client
 #[derive(Debug, Clone)]
 pub enum KubeconfigSource {
-    /// From KUBECONFIG environment variable or default path (~/.kube/config)
-    Environment,
+    /// From KUBECONFIG environment variable or default path (~/.kube/config),
+    /// with the context used (for `kubectl --context` in suggested commands)
+    Environment(Option<String>),
     /// Fetched from a specific Talos control plane node
     TalosNode(String),
     /// Source unknown or unavailable
@@ -90,7 +91,7 @@ pub async fn create_k8s_client_with_source(
                                 "KUBECONFIG context {} matches the Talos cluster; using it",
                                 context
                             );
-                            return Ok((client, KubeconfigSource::Environment));
+                            return Ok((client, KubeconfigSource::Environment(Some(context))));
                         }
                         // e.g. exec/OIDC auth we can't run: use the node's kubeconfig.
                         Err(e) => tracing::debug!(
@@ -142,7 +143,10 @@ pub async fn create_k8s_client_with_source(
         && let Ok(client) = Client::try_from(config)
     {
         tracing::debug!("Using kubeconfig from environment (KUBECONFIG or default path)");
-        return Ok((client, KubeconfigSource::Environment));
+        let context = kube::config::Kubeconfig::read()
+            .ok()
+            .and_then(|k| k.current_context);
+        return Ok((client, KubeconfigSource::Environment(context)));
     }
 
     // Last resort: try the main client (may fail with multiple nodes configured)

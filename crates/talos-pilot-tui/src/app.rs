@@ -1372,6 +1372,7 @@ impl App {
                 tracing::info!("ShowVolumes: '{}'", title);
 
                 let mut volumes = VolumesComponent::new(title, nodes);
+                volumes.set_context(self.cluster.current_context_name().map(str::to_string));
                 if let Some(state) = self.volumes_view_state.clone() {
                     volumes.set_view_state(state);
                 }

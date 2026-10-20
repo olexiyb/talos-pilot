@@ -900,9 +900,11 @@ pub fn volume_issues(volume: &LinstorVolume) -> Vec<Issue> {
 ///   A reconnect with equal UUIDs drops the bits without copying data.
 ///
 /// Nothing is suggested while a resync is running or without a Primary.
+/// `kubectl` is the command pinned to the cluster's context.
 pub fn remediation(
     volume: &LinstorVolume,
     satellites: &HashMap<String, SatellitePod>,
+    kubectl: &str,
 ) -> Vec<Remedy> {
     let Some(primary) = volume.replicas.iter().find(|r| r.in_use) else {
         return Vec::new();
@@ -916,11 +918,11 @@ pub fn remediation(
     };
     let exec = |node: &str, drbdadm: String| match satellites.get(node) {
         Some(pod) => format!(
-            "kubectl -n {} exec {} -c {SATELLITE_CONTAINER} -- drbdadm {drbdadm}",
+            "{kubectl} -n {} exec {} -c {SATELLITE_CONTAINER} -- drbdadm {drbdadm}",
             pod.namespace, pod.name
         ),
         None => format!(
-            "kubectl -n piraeus-datastore exec <linstor-satellite pod on {node}> \
+            "{kubectl} -n piraeus-datastore exec <linstor-satellite pod on {node}> \
              -c {SATELLITE_CONTAINER} -- drbdadm {drbdadm}"
         ),
     };
@@ -1338,15 +1340,19 @@ mod tests {
                 name: "linstor-satellite.bc1-kxfwm".to_string(),
             },
         )]);
-        let remedies = remediation(&vmsingle_with_stale_bits(), &satellites);
+        let remedies = remediation(
+            &vmsingle_with_stale_bits(),
+            &satellites,
+            "kubectl --context bc",
+        );
         assert_eq!(remedies.len(), 2);
         assert!(
             remedies[0]
                 .summary
                 .starts_with("Resync bc2 from Primary bc1")
         );
-        let exec =
-            "kubectl -n piraeus-datastore exec linstor-satellite.bc1-kxfwm -c linstor-satellite --";
+        let exec = "kubectl --context bc -n piraeus-datastore exec linstor-satellite.bc1-kxfwm \
+             -c linstor-satellite --";
         assert_eq!(
             remedies[0].commands,
             [
@@ -1373,7 +1379,7 @@ mod tests {
                 p.replication = Some("SyncSource".to_string());
             }
         }
-        assert!(remediation(&volume, &HashMap::new()).is_empty());
+        assert!(remediation(&volume, &HashMap::new(), "kubectl").is_empty());
     }
 
     #[test]
@@ -1529,7 +1535,7 @@ mod tests {
                     issue.severity, v.resource, v.pvc, issue.text
                 );
             }
-            for remedy in remediation(v, &satellites) {
+            for remedy in remediation(v, &satellites, "kubectl") {
                 println!("  fix: {}", remedy.summary);
                 for command in remedy.commands {
                     println!("       {command}");
