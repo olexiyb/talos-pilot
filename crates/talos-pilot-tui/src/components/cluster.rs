@@ -142,6 +142,12 @@ const OFFLINE_NODE_GRACE: std::time::Duration = std::time::Duration::from_secs(1
 /// online; an unreachable node otherwise waits out apid's ~20s proxy dial.
 const NODE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Upper bound for one cluster's background refresh. Most calls in it have
+/// their own timeout, but a request on a connection that died silently (e.g.
+/// across a laptop sleep) can wait forever, and a refresh that never returns
+/// is never retried: the cluster would show "connecting…" for good.
+const CLUSTER_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A known node that did not answer the last refresh (e.g. rebooting)
 #[derive(Debug, Clone)]
 struct OfflineNode {
@@ -228,6 +234,38 @@ struct ClusterData {
 }
 
 impl ClusterData {
+    /// This cluster, as it was before a refresh that did not finish within
+    /// [`CLUSTER_REFRESH_TIMEOUT`]. The client is dropped so the retry dials
+    /// a fresh connection instead of waiting on a dead one again. Data shown
+    /// so far stays; a first load turns into an error instead of
+    /// "connecting…".
+    fn refresh_timed_out(mut self) -> Self {
+        tracing::warn!(
+            "Refresh of {} did not finish within {:?}; reconnecting",
+            self.name,
+            CLUSTER_REFRESH_TIMEOUT
+        );
+        let first_load = !self.connected;
+        self.client = None;
+        self.loading = false;
+        if first_load {
+            self.connected = false;
+            self.error = Some(format!(
+                "No answer within {}s — retrying",
+                CLUSTER_REFRESH_TIMEOUT.as_secs()
+            ));
+        }
+        self
+    }
+
+    /// A refresh that failed outright (its task panicked)
+    fn refresh_failed(&mut self, error: String) {
+        self.loading = false;
+        if !self.connected {
+            self.error = Some(error);
+        }
+    }
+
     /// Refresh this cluster's data: etcd, roster, per-node stats.
     ///
     /// Operates only on this `ClusterData`, so it can run on a clone in a
@@ -1678,11 +1716,16 @@ impl ClusterComponent {
             if !due {
                 continue;
             }
+            let previous = cluster.clone();
             let mut cluster = cluster.clone();
             let config_path = self.config_path.clone();
             self.background_refresh[idx] = Some(tokio::spawn(async move {
-                cluster.refresh(config_path.as_deref()).await;
-                cluster
+                let refresh = cluster.refresh(config_path.as_deref());
+                match tokio::time::timeout(CLUSTER_REFRESH_TIMEOUT, refresh).await {
+                    Ok(()) => cluster,
+                    // Half-done state is inconsistent: keep what was shown
+                    Err(_) => previous.refresh_timed_out(),
+                }
             }));
         }
     }
@@ -1710,7 +1753,11 @@ impl ClusterComponent {
             let mut fresh = match handle.now_or_never() {
                 Some(Ok(fresh)) => fresh,
                 Some(Err(e)) => {
+                    // A panicked refresh: don't leave the cluster "connecting…"
                     tracing::warn!("Background cluster refresh failed: {}", e);
+                    if let Some(current) = self.clusters.get_mut(idx) {
+                        current.refresh_failed(format!("Refresh failed — {e}"));
+                    }
                     continue;
                 }
                 None => continue,
@@ -4327,6 +4374,46 @@ mod tests {
 
     fn names(nodes: &[(usize, &VersionInfo)]) -> Vec<String> {
         nodes.iter().map(|(_, v)| v.node.clone()).collect()
+    }
+
+    /// A first load that never finishes or fails turns into an error and is
+    /// retried, instead of showing "connecting…" for good
+    #[test]
+    fn stuck_or_failed_first_load_is_an_error() {
+        let connecting = || ClusterData {
+            name: "kprod".to_string(),
+            loading: true,
+            ..Default::default()
+        };
+
+        let timed_out = connecting().refresh_timed_out();
+        assert!(!timed_out.loading);
+        assert!(!timed_out.connected);
+        assert_eq!(
+            timed_out.error.as_deref(),
+            Some("No answer within 120s — retrying")
+        );
+
+        let mut failed = connecting();
+        failed.refresh_failed("Refresh failed — panicked".to_string());
+        assert!(!failed.loading);
+        assert_eq!(failed.error.as_deref(), Some("Refresh failed — panicked"));
+    }
+
+    /// A refresh that times out after the first load keeps the data shown
+    #[test]
+    fn stuck_refresh_keeps_shown_data() {
+        let loaded = ClusterData {
+            name: "kprod".to_string(),
+            connected: true,
+            versions: vec![ver("cp1")],
+            ..Default::default()
+        };
+        let timed_out = loaded.refresh_timed_out();
+        assert_eq!(timed_out.versions.len(), 1);
+        assert!(timed_out.client.is_none());
+        assert!(timed_out.connected);
+        assert_eq!(timed_out.error, None);
     }
 
     /// Discovery machineType is authoritative: a discovered worker is classified
