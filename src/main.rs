@@ -4,6 +4,7 @@ use clap::Parser;
 use color_eyre::Result;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use talos_pilot_tui::App;
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, prelude::*};
@@ -25,7 +26,7 @@ struct Cli {
     #[arg(short, long)]
     debug: bool,
 
-    /// Log file path (default: <temp_dir>/talos-pilot.log)
+    /// Log file path (default: <temp_dir>/talos-pilot-<pid>.log)
     #[arg(long)]
     log_file: Option<String>,
 
@@ -53,7 +54,10 @@ async fn main() -> Result<()> {
     // Initialize logging to file (not stdout, which would corrupt TUI)
     let log_file = match cli.log_file {
         Some(path) => File::create(path)?,
-        None => create_private_file(&resolve_log_path(None))?,
+        None => {
+            prune_old_logs(&std::env::temp_dir(), LOG_MAX_AGE);
+            create_private_file(&resolve_log_path(None))?
+        }
     };
 
     // Build filter: set base level, but quiet down noisy HTTP/gRPC libraries
@@ -116,11 +120,54 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Default logs older than this are removed at startup
+const LOG_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Resolve the log file path, falling back to the platform temp directory.
+///
+/// The default name carries the process id, so starting another instance
+/// never wipes the log of one that is still running.
 fn resolve_log_path(log_file: Option<String>) -> PathBuf {
     match log_file {
         Some(path) => PathBuf::from(path),
-        None => std::env::temp_dir().join("talos-pilot.log"),
+        None => std::env::temp_dir().join(default_log_name(std::process::id())),
+    }
+}
+
+fn default_log_name(pid: u32) -> String {
+    format!("talos-pilot-{pid}.log")
+}
+
+/// Whether `name` is a default log name (`talos-pilot-<pid>.log`)
+fn is_default_log_name(name: &str) -> bool {
+    name.strip_prefix("talos-pilot-")
+        .and_then(|rest| rest.strip_suffix(".log"))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Remove default logs in `dir` not written to for `max_age`, so per-instance
+/// logs don't pile up. Only regular files are removed (never what a symlink
+/// points to), and failures are ignored: another user's file in a shared
+/// temp dir simply stays.
+fn prune_old_logs(dir: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_str().is_some_and(is_default_log_name) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if meta.is_file() && stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -154,8 +201,43 @@ mod tests {
     #[test]
     fn default_log_path_uses_temp_dir() {
         let path = resolve_log_path(None);
-        let expected = std::env::temp_dir().join("talos-pilot.log");
+        let expected = std::env::temp_dir().join(format!("talos-pilot-{}.log", std::process::id()));
         assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn recognises_default_log_names() {
+        assert!(is_default_log_name(&default_log_name(86727)));
+        assert!(!is_default_log_name("talos-pilot.log"));
+        assert!(!is_default_log_name("talos-pilot-.log"));
+        assert!(!is_default_log_name("talos-pilot-12x.log"));
+        assert!(!is_default_log_name("other-12.log"));
+    }
+
+    #[test]
+    fn prunes_only_old_default_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("talos-pilot-1.log");
+        let fresh = dir.path().join("talos-pilot-2.log");
+        let other = dir.path().join("notes-3.log");
+        for path in [&old, &fresh, &other] {
+            std::fs::write(path, "x").unwrap();
+        }
+        let week_ago = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        for path in [&old, &other] {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(week_ago)
+                .unwrap();
+        }
+
+        prune_old_logs(dir.path(), LOG_MAX_AGE);
+
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(other.exists());
     }
 
     #[test]

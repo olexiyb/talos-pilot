@@ -209,6 +209,9 @@ talos-pilot --tail 1000
 
 # Enable debug logging
 talos-pilot --debug --log-file ~/talos-pilot.log
+
+# Without --log-file each instance logs to <temp dir>/talos-pilot-<pid>.log
+# ($TMPDIR on macOS); logs older than a week are removed at startup
 ```
 
 ### Bootstrap Wizard (Insecure Mode)
@@ -304,7 +307,7 @@ cargo test --all
 RUST_LOG=debug cargo run
 
 # Watch logs in another terminal
-tail -f /tmp/talos-pilot.log
+tail -f "$(ls -t ${TMPDIR:-/tmp}/talos-pilot-*.log | head -1)"
 
 # Check for warnings
 cargo clippy --all --all-targets -- -D warnings
