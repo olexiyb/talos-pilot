@@ -109,13 +109,13 @@ pub use client::{
 pub use config::{Context, TalosConfig};
 pub use error::TalosError;
 pub use talosctl::{
-    AddressStatus, DiscoveryMember, DiskInfo, GenConfigResult, InsecureApplyResult,
+    AddressStatus, DiscoveryMember, DiskInfo, EtcdSpecInfo, GenConfigResult, InsecureApplyResult,
     InsecureVersionInfo, KubeSpanPeerStatus, MachineConfigInfo, NodeNetworkInfo, TailscaleLink,
     VolumeStatus, apply_config_insecure, check_insecure_connection, gen_config, get_address_status,
     get_discovery_members, get_discovery_members_for_context, get_discovery_members_with_retry,
-    get_disks, get_disks_for_context, get_disks_for_node, get_disks_insecure, get_kubespan_peers,
-    get_kubespan_peers_for_node, get_machine_config, get_machine_config_for_node,
-    get_node_network_info, get_version_insecure, get_volume_status, get_volume_status_for_node,
-    get_volume_status_insecure, is_kubespan_enabled, is_kubespan_enabled_for_node,
-    patch_machineconfig_for_node, reboot_insecure, shutdown_insecure,
+    get_disks, get_disks_for_context, get_disks_for_node, get_disks_insecure,
+    get_etcd_spec_for_node, get_kubespan_peers, get_kubespan_peers_for_node, get_machine_config,
+    get_machine_config_for_node, get_node_network_info, get_version_insecure, get_volume_status,
+    get_volume_status_for_node, get_volume_status_insecure, is_kubespan_enabled,
+    is_kubespan_enabled_for_node, patch_machineconfig_for_node, reboot_insecure, shutdown_insecure,
 };

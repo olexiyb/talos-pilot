@@ -5,12 +5,20 @@
 //! a fragmented database (space a defrag would reclaim), entries committed
 //! but not applied, a member far behind the leader, and a database close to
 //! etcd's default quota.
+//!
+//! The selected member's etcd log streams live under the table.
+//!
+//! The addresses each member listens on come from its running etcd process
+//! (its command line, via the Processes API); the node's EtcdSpec (via
+//! `talosctl get etcdspec`: COSI is not reachable over the API) is what the
+//! config asks for. Both matter while moving etcd to another network.
 
 use crate::action::Action;
-use crate::components::{Component, KERNEL_SERVICE, LogNode};
+use crate::components::Component;
 use crate::ui_ext::QuorumStateExt;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
+use k8s_openapi::serde_json::{self, Value};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -18,11 +26,14 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 use talos_pilot_core::{
     AsyncState, QuorumState, SelectableList, format_bytes_signed, format_talos_error,
 };
-use talos_rs::{EtcdAlarm, EtcdMemberInfo, EtcdMemberStatus, TalosClient};
+use talos_rs::{EtcdAlarm, EtcdMemberInfo, EtcdMemberStatus, EtcdSpecInfo, TalosClient};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// Combined etcd member data (from member list + status)
 #[derive(Debug, Clone)]
@@ -31,6 +42,134 @@ pub struct EtcdMember {
     pub info: EtcdMemberInfo,
     /// Status from status call (None if unreachable)
     pub status: Option<EtcdMemberStatus>,
+    /// Addresses the node's config asks for (EtcdSpec; None until fetched)
+    pub spec: Option<EtcdSpecInfo>,
+    /// Addresses the running etcd process uses (None until fetched)
+    pub running: Option<EtcdFlags>,
+}
+
+/// Addresses (hosts) a running etcd was started with
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EtcdFlags {
+    pub advertise_client: Vec<String>,
+    pub listen_peer: Vec<String>,
+    pub listen_client: Vec<String>,
+}
+
+impl EtcdFlags {
+    /// From etcd's command line, e.g.
+    /// `/usr/local/bin/etcd --listen-peer-urls=https://10.0.0.1:2380,...`
+    fn parse(args: &str) -> Self {
+        let mut flags = Self::default();
+        for arg in args.split_whitespace() {
+            let Some((name, value)) = arg.split_once('=') else {
+                continue;
+            };
+            let target = match name {
+                "--advertise-client-urls" => &mut flags.advertise_client,
+                "--listen-peer-urls" => &mut flags.listen_peer,
+                "--listen-client-urls" => &mut flags.listen_client,
+                _ => continue,
+            };
+            *target = value.split(',').filter_map(url_host).collect();
+        }
+        flags
+    }
+}
+
+/// Host of `https://10.0.0.1:2380` or `https://[fd00::1]:2380`
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = match rest.strip_prefix('[') {
+        Some(v6) => v6.split(']').next()?,
+        None => rest.split(':').next()?,
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// EtcdSpecs and process lists change only with the machine config or a
+/// restart, so they are fetched less often than the status
+const ADDRESS_REFRESH: Duration = Duration::from_secs(60);
+
+fn is_loopback(address: &str) -> bool {
+    address
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Host of a member's first peer or client URL
+fn first_host(urls: &[String]) -> Option<String> {
+    url_host(urls.first()?)
+}
+
+/// Addresses without loopback, comma separated
+fn address_list(addresses: &[String]) -> String {
+    let list: Vec<&str> = addresses
+        .iter()
+        .filter(|a| !is_loopback(a))
+        .map(String::as_str)
+        .collect();
+    if list.is_empty() {
+        "-".to_string()
+    } else {
+        list.join(", ")
+    }
+}
+
+fn same_set(a: &[String], b: &[String]) -> bool {
+    a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
+}
+
+/// What is off with a member's addresses: etcd still running with addresses
+/// its config no longer asks for (they apply when etcd restarts), or else a
+/// member list that doesn't show the address the config advertises
+fn address_check(member: &EtcdMember) -> Option<String> {
+    let name = &member.info.hostname;
+    let spec = member.spec.as_ref()?;
+    if let Some(running) = &member.running {
+        let mut differences = Vec::new();
+        if !same_set(&running.advertise_client, &spec.advertised) {
+            differences.push(format!(
+                "advertises {} (config: {})",
+                running.advertise_client.join(", "),
+                spec.advertised.join(", ")
+            ));
+        }
+        if !same_set(&running.listen_peer, &spec.listen_peer)
+            || !same_set(&running.listen_client, &spec.listen_client)
+        {
+            differences.push(format!(
+                "listens on peer {} / client {} (config: peer {} / client {})",
+                address_list(&running.listen_peer),
+                address_list(&running.listen_client),
+                address_list(&spec.listen_peer),
+                address_list(&spec.listen_client)
+            ));
+        }
+        if !differences.is_empty() {
+            return Some(format!(
+                "{name}: etcd {}; the config applies when etcd restarts",
+                differences.join(", ")
+            ));
+        }
+    }
+    let stale: Vec<String> = [
+        ("peer", &member.info.peer_urls),
+        ("client", &member.info.client_urls),
+    ]
+    .into_iter()
+    .filter_map(|(kind, urls)| {
+        let host = url_host(urls.first()?)?;
+        (!spec.advertised.contains(&host)).then(|| format!("{kind} URL {host}"))
+    })
+    .collect();
+    (!spec.advertised.is_empty() && !stale.is_empty()).then(|| {
+        format!(
+            "{name}: config advertises {} but the member list has {}",
+            spec.advertised.join(", "),
+            stale.join(" and ")
+        )
+    })
 }
 
 /// Default auto-refresh interval in seconds
@@ -69,7 +208,11 @@ pub fn member_checks(members: &[EtcdMember]) -> Vec<EtcdCheck> {
         .iter()
         .find(|(_, s)| s.is_leader())
         .map(|(_, s)| s.raft_index);
-    let mut checks = Vec::new();
+    let mut checks: Vec<EtcdCheck> = members
+        .iter()
+        .filter_map(address_check)
+        .map(|text| EtcdCheck { error: false, text })
+        .collect();
     for (member, status) in &statuses {
         let name = &member.info.hostname;
         let lag = status.raft_index.saturating_sub(status.raft_applied_index);
@@ -159,6 +302,127 @@ pub struct EtcdData {
     pub total_db_size: i64,
     /// Current revision (from leader)
     pub revision: u64,
+    /// EtcdSpec and running etcd addresses per member IP, and when they
+    /// were fetched
+    pub specs: HashMap<String, EtcdSpecInfo>,
+    pub running: HashMap<String, EtcdFlags>,
+    pub addresses_at: Option<Instant>,
+}
+
+/// Log lines of the selected member fetched before following
+const LOG_TAIL: i32 = 100;
+/// Log lines kept for the log pane
+const LOG_KEEP: usize = 500;
+
+enum LogEvent {
+    Line(String),
+    Failed(String),
+    Ended,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+enum LogStatus {
+    /// Stream open, no line yet: a quiet log is not a failure
+    #[default]
+    Waiting,
+    Streaming,
+    Failed(String),
+    Ended,
+}
+
+/// The live etcd log of one member. Dropping it stops the stream.
+#[derive(Default)]
+struct MemberLog {
+    member: String,
+    lines: VecDeque<String>,
+    status: LogStatus,
+    rx: Option<mpsc::UnboundedReceiver<LogEvent>>,
+    task: Option<JoinHandle<()>>,
+}
+
+/// A background refresh works on a clone, which needs no stream: the
+/// component keeps its own
+impl Clone for MemberLog {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl Drop for MemberLog {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl MemberLog {
+    /// Take the lines and status the stream sent since the last call
+    fn drain(&mut self) {
+        let Some(rx) = &mut self.rx else {
+            return;
+        };
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                LogEvent::Line(line) => {
+                    self.status = LogStatus::Streaming;
+                    self.lines.push_back(line);
+                    if self.lines.len() > LOG_KEEP {
+                        self.lines.pop_front();
+                    }
+                }
+                LogEvent::Failed(e) => self.status = LogStatus::Failed(e),
+                LogEvent::Ended => self.status = LogStatus::Ended,
+            }
+        }
+    }
+}
+
+/// An etcd log line (zap JSON): time, level and message, colored by level,
+/// then its other fields. Lines that aren't JSON are shown as they are.
+fn log_line(line: &str) -> Line<'static> {
+    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(line) else {
+        return Line::raw(line.to_string());
+    };
+    let text = |value: Value| match value {
+        Value::String(s) => s,
+        other => other.to_string(),
+    };
+    let mut take = |key: &str| fields.remove(key).map(text).unwrap_or_default();
+    let level = take("level");
+    let ts = take("ts");
+    let msg = take("msg");
+    fields.remove("caller");
+    // 2026-10-20T14:52:47.096285Z -> 14:52:47
+    let time = ts.get(11..19).unwrap_or(&ts).to_string();
+    let color = match level.as_str() {
+        "error" | "dpanic" | "panic" | "fatal" => Color::Red,
+        "warn" => Color::Yellow,
+        "debug" => Color::DarkGray,
+        _ => Color::Reset,
+    };
+    let extra: Vec<String> = fields
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", text(value)))
+        .collect();
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    Line::from(vec![
+        Span::styled(format!("{time} "), dim),
+        Span::styled(format!("{level:<5} "), Style::default().fg(color)),
+        Span::styled(msg, Style::default().fg(color)),
+        Span::styled(format!("  {}", extra.join(" ")), dim),
+    ])
+}
+
+/// Members reporting errors, one line each
+fn member_errors(members: &[EtcdMember]) -> Vec<String> {
+    members
+        .iter()
+        .filter_map(|m| {
+            let errors = &m.status.as_ref()?.errors;
+            (!errors.is_empty()).then(|| format!("{}: {}", m.info.hostname, errors.join(", ")))
+        })
+        .collect()
 }
 
 /// Etcd cluster status component
@@ -176,8 +440,15 @@ pub struct EtcdComponent {
     /// Client for API calls
     client: Option<TalosClient>,
 
-    /// talosctl context of the cluster, for the copied defrag commands
+    /// talosctl context of the cluster, for the copied defrag commands and
+    /// the EtcdSpec queries
     context: Option<String>,
+
+    /// talosconfig path given with `--config`
+    config_path: Option<String>,
+
+    /// Live etcd log of the selected member
+    log: MemberLog,
 }
 
 impl Default for EtcdComponent {
@@ -197,6 +468,8 @@ impl EtcdComponent {
             auto_refresh: true,
             client: None,
             context: None,
+            config_path: None,
+            log: MemberLog::default(),
         }
     }
 
@@ -205,9 +478,69 @@ impl EtcdComponent {
         self.client = Some(client);
     }
 
+    /// Whether a client was set (the cluster may still be reconnecting)
+    pub fn has_client(&self) -> bool {
+        self.client.is_some()
+    }
+
     /// Name the talosctl context in copied commands
     pub fn set_context(&mut self, context: Option<String>) {
         self.context = context;
+    }
+
+    /// talosconfig to run talosctl with
+    pub fn set_config_path(&mut self, config_path: Option<String>) {
+        self.config_path = config_path;
+    }
+
+    /// Stream the selected member's etcd log, unless it already is
+    fn follow_selected_log(&mut self) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        let Some(member) = self.data().and_then(|d| d.members.selected()) else {
+            return;
+        };
+        if self.log.member == member.info.hostname {
+            return;
+        }
+        let name = member.info.hostname.clone();
+        // By IP: hostnames may not resolve
+        let Some(ip) = member.info.ip_address() else {
+            self.log = MemberLog {
+                member: name,
+                lines: VecDeque::new(),
+                status: LogStatus::Failed("no address to reach the member".to_string()),
+                rx: None,
+                task: None,
+            };
+            return;
+        };
+        let node = client.with_node(&ip);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            match node.logs_stream("etcd", LOG_TAIL).await {
+                Ok(mut lines) => {
+                    while let Some(line) = lines.recv().await {
+                        if tx.send(LogEvent::Line(line)).is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(LogEvent::Ended);
+                }
+                Err(e) => {
+                    let _ = tx.send(LogEvent::Failed(format_talos_error(&e)));
+                }
+            }
+        });
+        // Replacing the previous log stops its stream
+        self.log = MemberLog {
+            member: name,
+            lines: VecDeque::new(),
+            status: LogStatus::Waiting,
+            rx: Some(rx),
+            task: Some(task),
+        };
     }
 
     /// Copy the defrag commands, one per line, with a reminder to run them
@@ -243,7 +576,10 @@ impl EtcdComponent {
     /// Refresh etcd data from the cluster
     pub async fn refresh(&mut self) -> Result<()> {
         let Some(client) = &self.client else {
-            self.state.set_error("No client configured");
+            // Retried on the next refresh, which picks up the client once
+            // the cluster has reconnected
+            self.state
+                .set_error_with_retry("Not connected to the cluster — reconnecting");
             return Ok(());
         };
 
@@ -276,11 +612,64 @@ impl EtcdComponent {
 
         tracing::debug!("Fetching etcd status from control planes: {:?}", cp_ips);
 
-        // Step 3: Fetch status (targeting all CPs by IP) and alarms in parallel
-        let fetch_result = tokio::time::timeout(timeout, async {
-            tokio::join!(client.etcd_status_for_nodes(&cp_ips), client.etcd_alarms())
-        })
-        .await;
+        // Step 3: Fetch status (targeting all CPs by IP) and alarms in
+        // parallel, and the members' addresses when due (each query has its
+        // own timeout; a failed one keeps what was fetched before)
+        let mut specs = self.data().map(|d| d.specs.clone()).unwrap_or_default();
+        let mut running = self.data().map(|d| d.running.clone()).unwrap_or_default();
+        let mut addresses_at = self.data().and_then(|d| d.addresses_at);
+        let addresses_due = addresses_at.is_none_or(|at| at.elapsed() >= ADDRESS_REFRESH);
+        let (fetch_result, fetched) = tokio::join!(
+            tokio::time::timeout(timeout, async {
+                tokio::join!(client.etcd_status_for_nodes(&cp_ips), client.etcd_alarms())
+            }),
+            async {
+                if !addresses_due {
+                    return Vec::new();
+                }
+                let context = self.context.as_deref();
+                let config_path = self.config_path.as_deref();
+                futures::future::join_all(cp_ips.iter().map(|ip| async move {
+                    let node = client.with_node(ip);
+                    let (spec, processes) = tokio::join!(
+                        talos_rs::get_etcd_spec_for_node(context, ip, config_path),
+                        tokio::time::timeout(timeout, node.processes())
+                    );
+                    (ip.clone(), spec, processes)
+                }))
+                .await
+            }
+        );
+        if addresses_due {
+            addresses_at = Some(Instant::now());
+            for (ip, spec, processes) in fetched {
+                match spec {
+                    Ok(spec) => {
+                        specs.insert(ip.clone(), spec);
+                    }
+                    Err(e) => tracing::warn!("Failed to fetch etcd spec of {}: {}", ip, e),
+                }
+                let etcd = match processes {
+                    Ok(Ok(nodes)) => nodes
+                        .into_iter()
+                        .flat_map(|n| n.processes)
+                        .find(|p| p.executable.ends_with("/etcd") || p.command == "etcd"),
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to list processes of {}: {}", ip, e);
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::warn!("Listing processes of {} timed out", ip);
+                        continue;
+                    }
+                };
+                // No etcd process (stopped): nothing runs with any address
+                match etcd {
+                    Some(p) => running.insert(ip, EtcdFlags::parse(&p.args)),
+                    None => running.remove(&ip),
+                };
+            }
+        }
 
         let (status_result, alarms_result) = match fetch_result {
             Ok(results) => results,
@@ -316,7 +705,15 @@ impl EtcdComponent {
             .into_iter()
             .map(|info| {
                 let status = statuses.iter().find(|s| s.member_id == info.id).cloned();
-                EtcdMember { info, status }
+                let ip = info.ip_address().unwrap_or_default();
+                let spec = specs.get(&ip).cloned();
+                let running = running.get(&ip).cloned();
+                EtcdMember {
+                    info,
+                    status,
+                    spec,
+                    running,
+                }
             })
             .collect();
 
@@ -332,8 +729,14 @@ impl EtcdComponent {
                 quorum_state: QuorumState::Unknown,
                 total_db_size: 0,
                 revision: 0,
+                specs: HashMap::new(),
+                running: HashMap::new(),
+                addresses_at: None,
             }
         };
+        data.specs = specs;
+        data.running = running;
+        data.addresses_at = addresses_at;
 
         // Update alarms
         data.alarms = alarms;
@@ -384,6 +787,7 @@ impl EtcdComponent {
             data.members.select_prev_no_wrap();
             self.table_state.select(Some(data.members.selected_index()));
         }
+        self.follow_selected_log();
     }
 
     /// Navigate to next member
@@ -392,6 +796,7 @@ impl EtcdComponent {
             data.members.select_next_no_wrap();
             self.table_state.select(Some(data.members.selected_index()));
         }
+        self.follow_selected_log();
     }
 
     /// Draw the status bar
@@ -429,6 +834,18 @@ impl EtcdComponent {
             )),
             Span::raw(format!("   DB: {}    Rev: {}", db_size, data.revision)),
         ]);
+        let mut line = line;
+        // The same for every member, unless an election is running
+        let term = data
+            .members
+            .items()
+            .iter()
+            .filter_map(|m| m.status.as_ref())
+            .find(|s| s.is_leader())
+            .map(|s| s.raft_term);
+        if let Some(term) = term {
+            line.spans.push(Span::raw(format!("    Term: {term}")));
+        }
 
         let para = Paragraph::new(line).block(Block::default().borders(Borders::BOTTOM));
         frame.render_widget(para, area);
@@ -447,6 +864,9 @@ impl EtcdComponent {
             .map(|member| {
                 let (status_indicator, status_text, status_color) = match &member.status {
                     Some(s) if s.is_leader() => ("*", "Leader", Color::Magenta),
+                    Some(s) if s.is_learner || member.info.is_learner => {
+                        ("~", "Learner", Color::Yellow)
+                    }
                     Some(_) => ("o", "Follow", Color::Green),
                     None => ("x", "DOWN", Color::Red),
                 };
@@ -504,20 +924,54 @@ impl EtcdComponent {
                     })
                     .unwrap_or_else(|| "-".to_string());
 
-                // Get endpoint from client_urls
-                let endpoint = member
-                    .info
-                    .client_urls
-                    .first()
-                    .map(|u| u.replace("https://", "").replace("http://", ""))
-                    .unwrap_or_else(|| "unknown".to_string());
+                // Member list URLs; yellow when the config advertises
+                // another address (mid-move)
+                let url_cell = |urls: &[String]| {
+                    let host = first_host(urls);
+                    let stale = matches!(
+                        (&host, &member.spec),
+                        (Some(h), Some(spec)) if !spec.advertised.is_empty() && !spec.advertised.contains(h)
+                    );
+                    Cell::from(host.unwrap_or_else(|| "-".to_string())).style(
+                        Style::default().fg(if stale { Color::Yellow } else { Color::Reset }),
+                    )
+                };
+                let peer_url = url_cell(&member.info.peer_urls);
+                let client_url = url_cell(&member.info.client_urls);
 
                 let status_full = format!("{} {}", status_indicator, status_text);
 
+                // The running process, else (dim) what the config asks for
+                let (listen_peer, listen_client) = match (&member.running, &member.spec) {
+                    (Some(r), _) => (
+                        Cell::from(address_list(&r.listen_peer)),
+                        Cell::from(address_list(&r.listen_client)),
+                    ),
+                    (None, Some(s)) => {
+                        let dim = Style::default().add_modifier(Modifier::DIM);
+                        (
+                            Cell::from(address_list(&s.listen_peer)).style(dim),
+                            Cell::from(address_list(&s.listen_client)).style(dim),
+                        )
+                    }
+                    (None, None) => {
+                        let unknown = || {
+                            Cell::from("?").style(Style::default().add_modifier(Modifier::DIM))
+                        };
+                        (unknown(), unknown())
+                    }
+                };
+
                 Row::new(vec![
                     Cell::from(member.info.hostname.clone()),
+                    // What `talosctl etcd remove-member` takes
+                    Cell::from(format!("{:x}", member.info.id))
+                        .style(Style::default().add_modifier(Modifier::DIM)),
                     Cell::from(status_full).style(Style::default().fg(status_color)),
-                    Cell::from(endpoint),
+                    peer_url,
+                    client_url,
+                    listen_peer,
+                    listen_client,
                     Cell::from(db_size),
                     in_use,
                     Cell::from(raft_idx),
@@ -529,8 +983,12 @@ impl EtcdComponent {
 
         let header = Row::new(vec![
             Cell::from("MEMBER"),
+            Cell::from("ID"),
             Cell::from("STATUS"),
-            Cell::from("ENDPOINT"),
+            Cell::from("PEER URL"),
+            Cell::from("CLIENT URL"),
+            Cell::from("LISTEN PEER"),
+            Cell::from("LISTEN CLIENT"),
             Cell::from("DB SIZE"),
             Cell::from("IN USE"),
             Cell::from("RAFT IDX"),
@@ -541,15 +999,21 @@ impl EtcdComponent {
         .bottom_margin(1);
 
         // Use proportional column widths to fill available space
+        // Addresses share what the fixed columns leave, listen lists
+        // (often two addresses while moving) getting more
         let widths = [
-            Constraint::Min(12),        // MEMBER
-            Constraint::Length(10),     // STATUS
-            Constraint::Percentage(30), // ENDPOINT (flexible)
-            Constraint::Length(10),     // DB SIZE
-            Constraint::Length(7),      // IN USE
-            Constraint::Length(12),     // RAFT IDX
-            Constraint::Length(7),      // LAG
-            Constraint::Length(8),      // ERRORS
+            Constraint::Min(6),     // MEMBER
+            Constraint::Length(17), // ID
+            Constraint::Length(10), // STATUS
+            Constraint::Fill(2),    // PEER URL
+            Constraint::Fill(2),    // CLIENT URL
+            Constraint::Fill(3),    // LISTEN PEER
+            Constraint::Fill(3),    // LISTEN CLIENT
+            Constraint::Length(10), // DB SIZE
+            Constraint::Length(7),  // IN USE
+            Constraint::Length(10), // RAFT IDX
+            Constraint::Length(6),  // LAG
+            Constraint::Length(6),  // ERRORS
         ];
 
         let table = Table::new(rows, widths)
@@ -564,123 +1028,44 @@ impl EtcdComponent {
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
 
-    /// Draw the detail section for selected member
-    fn draw_detail_section(&self, frame: &mut Frame, area: Rect) {
-        let Some(data) = self.data() else {
-            return;
-        };
-        let Some(member) = data.members.selected() else {
-            return;
-        };
-
-        let role = match &member.status {
-            Some(s) if s.is_leader() => "Leader",
-            Some(s) if s.is_learner => "Learner",
-            Some(_) => "Follower",
-            None => "Unreachable",
-        };
-
-        let title = format!(" {} ({}) ", member.info.hostname, role);
-
-        let content = if let Some(status) = &member.status {
-            let peer_url = member.info.peer_urls.first().cloned().unwrap_or_default();
-            let client_url = member.info.client_urls.first().cloned().unwrap_or_default();
-            let db_in_use = format_bytes_signed(status.db_size_in_use);
-            let db_percent = if status.db_size > 0 {
-                (status.db_size_in_use as f64 / status.db_size as f64 * 100.0) as u32
-            } else {
-                0
-            };
-            let errors = if status.errors.is_empty() {
-                "None".to_string()
-            } else {
-                status.errors.join(", ")
-            };
-
-            vec![
-                Line::from(vec![
-                    Span::styled("  ID: ", Style::default().add_modifier(Modifier::DIM)),
-                    Span::raw(format!("{:x}", status.member_id)),
-                    Span::raw("                        "),
-                    Span::styled(
-                        "Raft Term:    ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::raw(status.raft_term.to_string()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "  Peer URL:   ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::raw(format!("{:<30}", peer_url)),
-                    Span::styled(
-                        "Raft Applied: ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::raw(status.raft_applied_index.to_string()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "  Client URL: ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::raw(format!("{:<30}", client_url)),
-                    Span::styled(
-                        "DB In Use:    ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::raw(format!("{} ({}%)", db_in_use, db_percent)),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "  Is Learner: ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::raw(format!(
-                        "{:<30}",
-                        if member.info.is_learner { "Yes" } else { "No" }
-                    )),
-                    Span::styled(
-                        "Errors:       ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::raw(errors),
-                ]),
-            ]
+    /// Draw the selected member's live etcd log, newest at the bottom
+    fn draw_log(&self, frame: &mut Frame, area: Rect) {
+        let title = if self.log.member.is_empty() {
+            " etcd log ".to_string()
         } else {
-            vec![
-                Line::from(vec![
-                    Span::styled("  ID: ", Style::default().add_modifier(Modifier::DIM)),
-                    Span::raw(format!("{:x}", member.info.id)),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "  Peer URL:   ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::raw(member.info.peer_urls.first().cloned().unwrap_or_default()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "  Client URL: ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::raw(member.info.client_urls.first().cloned().unwrap_or_default()),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Error: ", Style::default().add_modifier(Modifier::DIM)),
-                    Span::styled(
-                        "Connection failed - node may be down",
-                        Style::default().fg(Color::Red),
-                    ),
-                ]),
-            ]
+            format!(" etcd log · {} ", self.log.member)
         };
-
         let block = Block::default().title(title).borders(Borders::TOP);
-        let para = Paragraph::new(content).block(block);
-        frame.render_widget(para, area);
+        let height = block.inner(area).height as usize;
+
+        let status = match &self.log.status {
+            LogStatus::Waiting if self.log.member.is_empty() => None,
+            LogStatus::Waiting => Some(Line::styled(
+                "Waiting for log lines…",
+                Style::default().fg(Color::DarkGray),
+            )),
+            LogStatus::Streaming => None,
+            LogStatus::Failed(e) => Some(Line::styled(
+                format!("Log stream failed: {e}"),
+                Style::default().fg(Color::Red),
+            )),
+            LogStatus::Ended => Some(Line::styled(
+                "Log stream ended",
+                Style::default().fg(Color::DarkGray),
+            )),
+        };
+        let room = height.saturating_sub(usize::from(status.is_some()));
+        let skip = self.log.lines.len().saturating_sub(room);
+        let mut lines: Vec<Line> = self
+            .log
+            .lines
+            .iter()
+            .skip(skip)
+            .map(|l| log_line(l))
+            .collect();
+        lines.extend(status);
+
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
     /// Draw the alarms and member checks
@@ -721,6 +1106,12 @@ impl EtcdComponent {
                 ),
             ]));
         }
+        for errors in member_errors(data.members.items()) {
+            lines.push(Line::from(vec![
+                Span::styled("✗ ", Style::default().fg(Color::Red)),
+                Span::styled(errors, Style::default().fg(Color::Red)),
+            ]));
+        }
         for check in checks {
             let (symbol, color) = if check.error {
                 ("✗ ", Color::Red)
@@ -749,10 +1140,6 @@ impl EtcdComponent {
         let line = Line::from(vec![
             Span::styled("[j/k]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" select  "),
-            Span::styled("[l]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" etcd logs  "),
-            Span::styled("[Enter]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" member logs  "),
             Span::styled("[r]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" refresh  "),
             Span::styled("[c]", Style::default().add_modifier(Modifier::BOLD)),
@@ -792,69 +1179,13 @@ impl Component for EtcdComponent {
                 self.auto_refresh = !self.auto_refresh;
                 Ok(None)
             }
-            KeyCode::Char('l') => {
-                // View etcd logs for all control plane nodes
-                let Some(data) = self.data() else {
-                    return Ok(None);
-                };
-                if data.members.is_empty() {
-                    return Ok(None);
-                }
-                // Every member, addressed by IP (hostnames may not resolve)
-                let nodes: Vec<LogNode> = data
-                    .members
-                    .items()
-                    .iter()
-                    .filter_map(|m| {
-                        Some(LogNode {
-                            name: m.info.hostname.clone(),
-                            ip: m.info.ip_address()?,
-                            services: Some(vec!["etcd".to_string()]),
-                        })
-                    })
-                    .collect();
-                if nodes.is_empty() {
-                    return Ok(None);
-                }
-                Ok(Some(Action::ShowMultiLogs(
-                    "etcd".to_string(),
-                    format!("{} members", nodes.len()),
-                    nodes,
-                    vec!["etcd".to_string()],
-                    vec!["etcd".to_string(), KERNEL_SERVICE.to_string()],
-                )))
-            }
-            KeyCode::Enter => {
-                // View etcd logs for selected member
-                // Use IP address since hostnames may not be resolvable
-                if let Some(data) = self.data()
-                    && let Some(member) = data.members.selected()
-                {
-                    let node = member
-                        .info
-                        .ip_address()
-                        .unwrap_or_else(|| member.info.hostname.clone());
-                    let etcd_vec = vec!["etcd".to_string()];
-                    return Ok(Some(Action::ShowMultiLogs(
-                        node.clone(),
-                        "controlplane".to_string(),
-                        vec![LogNode {
-                            name: member.info.hostname.clone(),
-                            ip: node,
-                            services: Some(etcd_vec.clone()),
-                        }],
-                        etcd_vec.clone(),
-                        etcd_vec,
-                    )));
-                }
-                Ok(None)
-            }
             _ => Ok(None),
         }
     }
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         if let Action::Tick = action {
+            self.log.drain();
             // Check for auto-refresh using AsyncState helper
             let interval = Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS);
             if self.state.should_auto_refresh(self.auto_refresh, interval) {
@@ -882,63 +1213,36 @@ impl Component for EtcdComponent {
             return Ok(());
         }
 
-        // Get data for layout calculations
+        // Get data for layout calculations; before the first refresh has
+        // started there is none yet
         let Some(data) = self.data() else {
+            let loading = Paragraph::new("Loading...").style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(loading, area);
             return Ok(());
         };
 
-        // Calculate dynamic heights
-        let member_count = data.members.len().max(1);
-        let table_height = (member_count + 2) as u16; // header + members + padding
-        let detail_height = 6u16;
-        // Alarms line, then one line per check (or "Checks: OK"), plus borders
-        let alarm_height = (member_checks(data.members.items()).len().max(1) + 3) as u16;
+        let table_height = (data.members.len().max(1) + 2) as u16; // header + members + padding
+        // Alarms line, member errors, then one line per check (or "Checks:
+        // OK"), plus borders
+        let alarm_height = (1
+            + member_errors(data.members.items()).len()
+            + member_checks(data.members.items()).len().max(1)
+            + 2) as u16;
 
-        // Total content height (excluding flexible space)
-        let content_height = 3 + table_height + 1 + detail_height + 1 + alarm_height + 1;
+        let [status, table, alarms, log, footer] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(table_height),
+            Constraint::Length(alarm_height),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
-        // Layout: group content at top with small gaps, footer pinned to bottom
-        let chunks = if area.height > content_height + 10 {
-            // Large terminal: add breathing room between sections
-            Layout::vertical([
-                Constraint::Length(3),             // Status bar (with padding)
-                Constraint::Length(table_height),  // Member table
-                Constraint::Length(2),             // Spacer
-                Constraint::Length(detail_height), // Detail section
-                Constraint::Length(2),             // Spacer
-                Constraint::Length(alarm_height),  // Alarms
-                Constraint::Fill(1),               // Flexible space before footer
-                Constraint::Length(1),             // Footer
-            ])
-            .split(area)
-        } else {
-            // Compact terminal: minimal spacing
-            Layout::vertical([
-                Constraint::Length(2),             // Status bar
-                Constraint::Length(table_height),  // Member table
-                Constraint::Length(detail_height), // Detail section
-                Constraint::Length(alarm_height),  // Alarms
-                Constraint::Fill(1),               // Flexible space
-                Constraint::Length(1),             // Footer
-            ])
-            .split(area)
-        };
-
-        if area.height > content_height + 10 {
-            // Large terminal layout indices
-            self.draw_status_bar(frame, chunks[0]);
-            self.draw_member_table(frame, chunks[1]);
-            self.draw_detail_section(frame, chunks[3]);
-            self.draw_alarms(frame, chunks[5]);
-            self.draw_footer(frame, chunks[7]);
-        } else {
-            // Compact layout indices
-            self.draw_status_bar(frame, chunks[0]);
-            self.draw_member_table(frame, chunks[1]);
-            self.draw_detail_section(frame, chunks[2]);
-            self.draw_alarms(frame, chunks[3]);
-            self.draw_footer(frame, chunks[5]);
-        }
+        self.draw_status_bar(frame, status);
+        self.draw_member_table(frame, table);
+        self.draw_alarms(frame, alarms);
+        self.draw_log(frame, log);
+        self.draw_footer(frame, footer);
 
         Ok(())
     }
@@ -954,6 +1258,7 @@ impl crate::components::BackgroundRefresh for EtcdComponent {
         }
         let index = self.data().map(|d| d.members.selected_index()).unwrap_or(0);
         self.table_state.select(Some(index));
+        self.follow_selected_log();
     }
 }
 
@@ -992,7 +1297,130 @@ mod tests {
                 errors: Vec::new(),
                 is_learner: false,
             }),
+            spec: None,
+            running: None,
         }
+    }
+
+    fn hosts(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reads_addresses_from_the_etcd_command_line() {
+        let flags = EtcdFlags::parse(
+            "/usr/local/bin/etcd --advertise-client-urls=https://100.100.0.6:2379 \
+             --listen-client-urls=https://127.0.0.1:2379,https://100.100.0.6:2379,https://116.202.55.89:2379 \
+             --listen-client-http-urls=https://127.0.0.1:2383 \
+             --listen-peer-urls=https://100.100.0.6:2380,https://[fd00::6]:2380 --name=kpc3",
+        );
+        assert_eq!(flags.advertise_client, ["100.100.0.6"]);
+        assert_eq!(
+            flags.listen_client,
+            ["127.0.0.1", "100.100.0.6", "116.202.55.89"]
+        );
+        assert_eq!(flags.listen_peer, ["100.100.0.6", "fd00::6"]);
+    }
+
+    #[test]
+    fn lists_addresses_without_loopback() {
+        let client = hosts(&["127.0.0.1", "100.100.0.6", "116.202.55.89"]);
+        assert_eq!(address_list(&client), "100.100.0.6, 116.202.55.89");
+        assert_eq!(address_list(&hosts(&["127.0.0.1"])), "-");
+        assert_eq!(
+            first_host(&hosts(&["https://116.202.55.89:2380"])).as_deref(),
+            Some("116.202.55.89")
+        );
+    }
+
+    #[test]
+    fn checks_addresses_against_the_config() {
+        // kpc3: config moved to the public address, peer URL already
+        // updated, etcd not restarted yet
+        let mut m = member("kpc3", 6, 6, 0, 0, (1, 1));
+        m.info.peer_urls = vec!["https://116.202.55.89:2380".to_string()];
+        m.info.client_urls = vec!["https://10.0.0.6:2379".to_string()];
+        let both = hosts(&["116.202.55.89", "10.0.0.6"]);
+        m.spec = Some(EtcdSpecInfo {
+            advertised: hosts(&["116.202.55.89"]),
+            listen_peer: both.clone(),
+            listen_client: [hosts(&["127.0.0.1"]), both.clone()].concat(),
+        });
+        // Not fetched yet: nothing to say
+        assert_eq!(address_check(&member("kpc1", 1, 1, 0, 0, (1, 1))), None);
+
+        m.running = Some(EtcdFlags {
+            advertise_client: hosts(&["10.0.0.6"]),
+            listen_peer: hosts(&["10.0.0.6", "116.202.55.89"]),
+            listen_client: hosts(&["127.0.0.1", "10.0.0.6", "116.202.55.89"]),
+        });
+        assert_eq!(
+            address_check(&m).as_deref(),
+            Some(
+                "kpc3: etcd advertises 10.0.0.6 (config: 116.202.55.89); the config \
+                 applies when etcd restarts"
+            )
+        );
+
+        // Restarted with the config, but the member list kept the old
+        // client URL
+        m.running = Some(EtcdFlags {
+            advertise_client: hosts(&["116.202.55.89"]),
+            listen_peer: both.clone(),
+            listen_client: [hosts(&["127.0.0.1"]), both].concat(),
+        });
+        assert_eq!(
+            address_check(&m).as_deref(),
+            Some(
+                "kpc3: config advertises 116.202.55.89 but the member list has client URL 10.0.0.6"
+            )
+        );
+        assert!(member_checks(&[m.clone()]).iter().any(|c| !c.error));
+
+        // Done
+        m.info.client_urls = vec!["https://116.202.55.89:2379".to_string()];
+        assert_eq!(address_check(&m), None);
+    }
+
+    #[test]
+    fn formats_etcd_json_log_lines() {
+        let line = log_line(
+            r#"{"level":"warn","ts":"2026-10-20T14:53:47.097060Z","caller":"etcdserver/corrupt.go:278","msg":"slow apply","took":"1.2s"}"#,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "14:53:47 warn  slow apply  took=1.2s");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
+        // Not JSON: as it is
+        let raw = log_line("plain text");
+        assert_eq!(raw.spans[0].content, "plain text");
+    }
+
+    #[tokio::test]
+    async fn log_keeps_the_newest_lines() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut log = MemberLog::default();
+        log.rx = Some(rx);
+        assert_eq!(log.status, LogStatus::Waiting);
+        for i in 0..LOG_KEEP + 5 {
+            tx.send(LogEvent::Line(i.to_string())).unwrap();
+        }
+        log.drain();
+        assert_eq!(log.status, LogStatus::Streaming);
+        assert_eq!(log.lines.len(), LOG_KEEP);
+        assert_eq!(log.lines.front().map(String::as_str), Some("5"));
+        tx.send(LogEvent::Ended).unwrap();
+        log.drain();
+        assert_eq!(log.status, LogStatus::Ended);
+    }
+
+    #[test]
+    fn lists_member_errors() {
+        let mut members = vec![
+            member("bc1", 1, 1, 100, 100, (5, 5)),
+            member("bc2", 2, 1, 100, 100, (5, 5)),
+        ];
+        members[1].status.as_mut().unwrap().errors = vec!["NOSPACE".to_string()];
+        assert_eq!(member_errors(&members), ["bc2: NOSPACE"]);
     }
 
     /// `TALOS_PILOT_LIVE_CONTEXT=bc cargo test --lib live_etcd_checks -- --ignored --nocapture`

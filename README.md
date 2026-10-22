@@ -64,7 +64,7 @@ Use **talos-pilot** for "why won't my node join the cluster?"
 | **Processes View** | htop-like process list with tree view, CPU/MEM sorting |
 | **Network Stats** | Interface traffic, connections, KubeSpan peers, packet capture |
 | **Storage/Disks** | Disk list with size, transport, serial, system disk indicators |
-| **etcd Status** | Quorum health, member list, alarms, leader tracking |
+| **etcd Status** | Quorum health, member list, alarms, leader tracking, peer/client and listen addresses (running vs config), live etcd log of the selected member |
 | **Workload Health** | K8s deployments, statefulsets, pod issues by namespace |
 | **Lifecycle View** | Version status, config drift detection, cluster alerts |
 

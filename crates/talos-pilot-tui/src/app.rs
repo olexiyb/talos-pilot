@@ -105,6 +105,8 @@ pub struct App {
     should_quit: bool,
     /// Current view
     view: View,
+    /// View the logs screen was opened from, to go back to
+    logs_return: View,
     /// Cluster component
     cluster: ClusterComponent,
     /// Multi-service logs component (created when viewing logs)
@@ -183,6 +185,7 @@ impl App {
         Self {
             should_quit: false,
             view: View::Cluster,
+            logs_return: View::Cluster,
             cluster: ClusterComponent::new(config_path.clone(), context),
             multi_logs: None,
             log_level_filter: crate::components::multi_logs::ALL_LEVELS,
@@ -937,8 +940,13 @@ impl App {
                     }
                     View::Cluster => {}
                 }
-                // Return to cluster view
-                self.view = View::Cluster;
+                // Logs go back to the view they were opened from (its
+                // component is still there), everything else to the cluster
+                self.view = if self.view == View::MultiLogs {
+                    std::mem::replace(&mut self.logs_return, View::Cluster)
+                } else {
+                    View::Cluster
+                };
             }
             Action::Tick => {
                 // Update animations, etc.
@@ -1060,8 +1068,14 @@ impl App {
                     }
                     View::Etcd => {
                         if self.refresh_job.is_none()
-                            && let Some(etcd) = &self.etcd
+                            && let Some(etcd) = &mut self.etcd
                         {
+                            // Opened while the cluster was reconnecting
+                            if !etcd.has_client()
+                                && let Some(client) = self.cluster.client()
+                            {
+                                etcd.set_client(client.clone());
+                            }
                             self.refresh_job = Some(RefreshJob::Etcd(spawn_refresh!(etcd)));
                         }
                     }
@@ -1152,6 +1166,9 @@ impl App {
             }
             Action::ShowMultiLogs(title, subtitle, nodes, active_services, all_services) => {
                 tracing::info!("Viewing logs of {} ({} nodes)", title, nodes.len());
+                if self.view != View::MultiLogs {
+                    self.logs_return = self.view.clone();
+                }
 
                 // Create multi-logs component with all services, marking active ones
                 let mut multi_logs =
@@ -1238,10 +1255,13 @@ impl App {
 
                 // Set the client and refresh data
                 etcd.set_context(self.cluster.current_context_name().map(str::to_string));
+                etcd.set_config_path(self.config_path.clone());
+                // Without a client (the cluster is reconnecting) the refresh
+                // shows that instead of a blank view, and retries
                 if let Some(client) = self.cluster.client() {
                     etcd.set_client(client.clone());
-                    self.refresh_job = Some(RefreshJob::Etcd(spawn_refresh!(etcd)));
                 }
+                self.refresh_job = Some(RefreshJob::Etcd(spawn_refresh!(etcd)));
 
                 self.etcd = Some(etcd);
                 self.view = View::Etcd;

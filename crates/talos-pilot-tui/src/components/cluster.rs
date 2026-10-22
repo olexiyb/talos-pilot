@@ -148,6 +148,9 @@ const NODE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// is never retried: the cluster would show "connecting…" for good.
 const CLUSTER_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How soon a cluster without a connection is dialled again
+const RECONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A known node that did not answer the last refresh (e.g. rebooting)
 #[derive(Debug, Clone)]
 struct OfflineNode {
@@ -1708,9 +1711,12 @@ impl ClusterComponent {
             if self.background_refresh[idx].is_some() || cluster.context.is_none() {
                 continue;
             }
-            // The first load always runs; after that, only with auto-refresh on
+            // The first load always runs, and so does reconnecting a cluster
+            // whose connection was dropped (views take their client from
+            // here); otherwise only with auto-refresh on
             let due = match self.cluster_refreshed_at[idx] {
                 None => true,
+                Some(at) if cluster.client.is_none() => at.elapsed() >= RECONNECT_INTERVAL,
                 Some(at) => self.auto_refresh && at.elapsed() >= interval,
             };
             if !due {

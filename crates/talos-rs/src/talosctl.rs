@@ -784,6 +784,48 @@ async fn get_resource_yaml(
         })?
 }
 
+/// Addresses etcd advertises and listens on, from the EtcdSpec resource
+/// (what Talos derived from `cluster.etcd.advertisedSubnets/listenSubnets`)
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EtcdSpecInfo {
+    pub advertised: Vec<String>,
+    pub listen_peer: Vec<String>,
+    pub listen_client: Vec<String>,
+}
+
+/// Get the etcd spec of a control plane node in `context` (async, with timeout)
+pub async fn get_etcd_spec_for_node(
+    context: Option<&str>,
+    node_ip: &str,
+    config_path: Option<&str>,
+) -> Result<EtcdSpecInfo, TalosError> {
+    let output = get_resource_yaml(context, node_ip, config_path, &["etcdspec"]).await?;
+    parse_etcd_spec_yaml(&output)
+}
+
+fn parse_etcd_spec_yaml(yaml_str: &str) -> Result<EtcdSpecInfo, TalosError> {
+    let spec = yaml_str
+        .split("\n---")
+        .filter_map(|doc| serde_yaml::from_str::<serde_yaml::Value>(doc.trim()).ok())
+        .find_map(|doc| doc.get("spec").cloned())
+        .ok_or_else(|| TalosError::ConfigInvalid("no EtcdSpec in talosctl output".to_string()))?;
+    let addresses = |key: &str| -> Vec<String> {
+        spec.get(key)
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(EtcdSpecInfo {
+        advertised: addresses("advertisedAddresses"),
+        listen_peer: addresses("listenPeerAddresses"),
+        listen_client: addresses("listenClientAddresses"),
+    })
+}
+
 /// Get KubeSpan peer status for a node in `context` (async, with timeout)
 pub async fn get_kubespan_peers_for_node(
     context: Option<&str>,
@@ -1564,6 +1606,36 @@ fn parse_duration_to_ms(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_etcd_spec() {
+        let yaml = "node: 10.22.1.3
+metadata:
+    namespace: etcd
+    type: EtcdSpecs.etcd.talos.dev
+    id: etcd
+spec:
+    name: kpc3
+    advertisedAddresses:
+        - 100.100.0.6
+    listenPeerAddresses:
+        - 100.100.0.6
+        - 116.202.55.89
+    listenClientAddresses:
+        - 127.0.0.1
+        - 100.100.0.6
+        - 116.202.55.89
+    image: registry.k8s.io/etcd:v3.7.2
+";
+        let spec = parse_etcd_spec_yaml(yaml).unwrap();
+        assert_eq!(spec.advertised, ["100.100.0.6"]);
+        assert_eq!(spec.listen_peer, ["100.100.0.6", "116.202.55.89"]);
+        assert_eq!(
+            spec.listen_client,
+            ["127.0.0.1", "100.100.0.6", "116.202.55.89"]
+        );
+        assert!(parse_etcd_spec_yaml("").is_err());
+    }
+
     use super::*;
 
     #[test]
