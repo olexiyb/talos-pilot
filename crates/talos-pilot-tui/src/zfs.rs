@@ -67,10 +67,27 @@ impl ZfsVolume {
     }
 }
 
+/// API group of the OpenEBS ZFS LocalPV CRDs
+const ZFS_GROUP: &str = "zfs.openebs.io";
+
+/// Whether the cluster serves the ZFS LocalPV API group.
+///
+/// Listing a CRD that isn't installed returns a plain-text 404, which kube
+/// logs as a warning ("Unsuccessful data error parse: 404 page not found")
+/// before we can treat it as "no ZFS"; the cluster view lists ZFS pools on
+/// every refresh. The group list is always served, so ask it first.
+async fn zfs_installed(client: &Client) -> Result<bool, kube::Error> {
+    let groups = client.list_api_groups().await?;
+    Ok(groups.groups.iter().any(|g| g.name == ZFS_GROUP))
+}
+
 /// OpenEBS ZFS LocalPV volumes, `None` when the `ZFSVolume` CRD isn't
 /// installed. Their PVC names come from the PVs, set by the caller.
 pub async fn fetch_zfs_volumes(client: &Client) -> Result<Option<Vec<ZfsVolume>>, kube::Error> {
-    let gvk = GroupVersionKind::gvk("zfs.openebs.io", "v1", "ZFSVolume");
+    if !zfs_installed(client).await? {
+        return Ok(None);
+    }
+    let gvk = GroupVersionKind::gvk(ZFS_GROUP, "v1", "ZFSVolume");
     let resource = ApiResource::from_gvk_with_plural(&gvk, "zfsvolumes");
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &resource);
     match crate::kube_list::list(&api, &ListParams::default()).await {
@@ -173,7 +190,10 @@ pub fn zfs_volume_issues(volume: &ZfsVolume) -> Vec<crate::linstor_volumes::Issu
 pub async fn fetch_zfs_pools(
     client: &Client,
 ) -> Result<HashMap<String, Vec<ZfsPool>>, kube::Error> {
-    let gvk = GroupVersionKind::gvk("zfs.openebs.io", "v1", "ZFSNode");
+    if !zfs_installed(client).await? {
+        return Ok(HashMap::new());
+    }
+    let gvk = GroupVersionKind::gvk(ZFS_GROUP, "v1", "ZFSNode");
     let resource = ApiResource::from_gvk_with_plural(&gvk, "zfsnodes");
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &resource);
 
