@@ -684,6 +684,12 @@ impl App {
                 self.handle_action(Action::Tick).await?;
             }
 
+            // Hand control to tokio once per loop. The loop otherwise never
+            // returns Pending, so tokio's cooperative budget for this task
+            // never refills, and once it is spent every await on a budgeted
+            // resource (and every poll of a finished task) reads as pending.
+            tokio::task::yield_now().await;
+
             // Check async results (non-blocking)
             self.poll_refresh_job();
             self.poll_view_setup();
@@ -720,8 +726,6 @@ impl App {
     /// Handle an action
     /// Hand a finished background refresh back to its component
     fn poll_refresh_job(&mut self) {
-        use futures::FutureExt;
-
         if !self.refresh_job.as_ref().is_some_and(|j| j.is_finished()) {
             return;
         }
@@ -734,7 +738,7 @@ impl App {
         macro_rules! finish {
             ($slot:expr, $handle:expr) => {
                 if let Some(c) = &mut $slot {
-                    match $handle.now_or_never() {
+                    match crate::task::poll_finished($handle) {
                         Some(Ok(refreshed)) => c.adopt_refresh(refreshed),
                         Some(Err(e)) => {
                             tracing::error!("View refresh task failed: {}", e);
@@ -760,14 +764,14 @@ impl App {
     /// Finish view setup that ran in the background: the Kubernetes client
     /// of rolling operations
     fn poll_view_setup(&mut self) {
-        use futures::FutureExt;
-
         if self
             .rolling_k8s_fetch
             .as_ref()
             .is_some_and(|h| h.is_finished())
-            && let Some(Some(Ok(Some(k8s)))) =
-                self.rolling_k8s_fetch.take().map(|h| h.now_or_never())
+            && let Some(Some(Ok(Some(k8s)))) = self
+                .rolling_k8s_fetch
+                .take()
+                .map(crate::task::poll_finished)
             && let Some(rolling_ops) = &mut self.rolling_operations
         {
             rolling_ops.set_k8s_client(k8s);
@@ -1070,10 +1074,10 @@ impl App {
                         if self.refresh_job.is_none()
                             && let Some(etcd) = &mut self.etcd
                         {
-                            // Opened while the cluster was reconnecting
-                            if !etcd.has_client()
-                                && let Some(client) = self.cluster.client()
-                            {
+                            // The cluster's current connection: one it
+                            // redialled replaces a dead one, and one opened
+                            // while it was reconnecting gets one at all
+                            if let Some(client) = self.cluster.client() {
                                 etcd.set_client(client.clone());
                             }
                             self.refresh_job = Some(RefreshJob::Etcd(spawn_refresh!(etcd)));

@@ -868,12 +868,10 @@ impl NodeOperationsComponent {
 
     /// Apply finished safety checks, if any
     fn poll_safety_checks(&mut self) {
-        use futures::FutureExt;
-
         if !self.safety_task.as_ref().is_some_and(|t| t.is_finished()) {
             return;
         }
-        let Some(Some(Ok(checks))) = self.safety_task.take().map(|t| t.now_or_never()) else {
+        let Some(Some(Ok(checks))) = self.safety_task.take().map(crate::task::poll_finished) else {
             return;
         };
         match checks.new_k8s {

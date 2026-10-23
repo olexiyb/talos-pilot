@@ -91,12 +91,10 @@ impl Drop for NetworkTasks {
 
 /// Take a task's result once it has finished, without waiting
 fn take_finished<T>(task: &mut Option<JoinHandle<T>>) -> Option<T> {
-    use futures::FutureExt;
-
     if !task.as_ref().is_some_and(|t| t.is_finished()) {
         return None;
     }
-    task.take()?.now_or_never()?.ok()
+    crate::task::poll_finished(task.take()?)?.ok()
 }
 
 /// Well-known Talos/Kubernetes service ports
@@ -588,11 +586,9 @@ impl NetworkStatsComponent {
     /// than the gRPC stats, so it runs in a spawned task on its own cadence
     /// instead of holding up every 2s refresh (which blocks the event loop).
     fn poll_kubespan_data(&mut self) {
-        use futures::FutureExt;
-
         if self.kubespan_task.as_ref().is_some_and(|t| t.is_finished())
             && let Some(task) = self.kubespan_task.take()
-            && let Some(Ok((enabled, peers))) = task.now_or_never()
+            && let Some(Ok((enabled, peers))) = crate::task::poll_finished(task)
         {
             if let Some(data) = self.data_mut() {
                 data.kubespan_enabled = enabled;

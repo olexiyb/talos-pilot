@@ -414,6 +414,15 @@ fn log_line(line: &str) -> Line<'static> {
     ])
 }
 
+/// "42s", "5m", "3h"
+fn short_age(age: Duration) -> String {
+    match age.as_secs() {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h", s / 3600),
+    }
+}
+
 /// Members reporting errors, one line each
 fn member_errors(members: &[EtcdMember]) -> Vec<String> {
     members
@@ -501,7 +510,10 @@ impl EtcdComponent {
         let Some(member) = self.data().and_then(|d| d.members.selected()) else {
             return;
         };
-        if self.log.member == member.info.hostname {
+        // A stream that failed or ended (e.g. its connection died) is
+        // opened again on the next refresh
+        let open = matches!(self.log.status, LogStatus::Waiting | LogStatus::Streaming);
+        if self.log.member == member.info.hostname && open {
             return;
         }
         let name = member.info.hostname.clone();
@@ -578,6 +590,7 @@ impl EtcdComponent {
         let Some(client) = &self.client else {
             // Retried on the next refresh, which picks up the client once
             // the cluster has reconnected
+            tracing::warn!("etcd: no connection to the cluster yet");
             self.state
                 .set_error_with_retry("Not connected to the cluster — reconnecting");
             return Ok(());
@@ -594,11 +607,13 @@ impl EtcdComponent {
             Ok(Ok(members)) => members,
             Ok(Err(e)) => {
                 let msg = format_talos_error(&e);
+                tracing::warn!("etcd: failed to fetch members: {}", msg);
                 self.state
                     .set_error_with_retry(format!("Failed to fetch members: {}", msg));
                 return Ok(());
             }
             Err(_) => {
+                tracing::warn!("etcd: request timed out after {}s", timeout.as_secs());
                 self.state.set_error_with_retry(format!(
                     "Request timed out after {}s",
                     timeout.as_secs()
@@ -674,6 +689,7 @@ impl EtcdComponent {
         let (status_result, alarms_result) = match fetch_result {
             Ok(results) => results,
             Err(_) => {
+                tracing::warn!("etcd: request timed out after {}s", timeout.as_secs());
                 self.state.set_error_with_retry(format!(
                     "Request timed out after {}s",
                     timeout.as_secs()
@@ -845,6 +861,19 @@ impl EtcdComponent {
             .map(|s| s.raft_term);
         if let Some(term) = term {
             line.spans.push(Span::raw(format!("    Term: {term}")));
+        }
+        // A failed refresh over data shown: say so, or the screen just
+        // freezes on old numbers
+        if let Some(error) = self.state.error() {
+            let age = self
+                .state
+                .elapsed_since_refresh()
+                .map(|d| format!(" — data from {} ago", short_age(d)))
+                .unwrap_or_default();
+            line.spans.push(Span::styled(
+                format!("    ⚠ {error}{age}"),
+                Style::default().fg(Color::Red),
+            ));
         }
 
         let para = Paragraph::new(line).block(Block::default().borders(Borders::BOTTOM));

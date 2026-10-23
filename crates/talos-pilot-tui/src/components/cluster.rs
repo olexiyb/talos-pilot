@@ -148,6 +148,12 @@ const NODE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// is never retried: the cluster would show "connecting…" for good.
 const CLUSTER_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Bound on the first call of a refresh. A connection that died silently
+/// (network change, tailnet switch) or stalled makes it hang; dropping the
+/// client then redials within [`RECONNECT_INTERVAL`] instead of waiting out
+/// [`CLUSTER_REFRESH_TIMEOUT`] while views keep using the dead connection.
+const MEMBERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// How soon a cluster without a connection is dialled again
 const RECONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -313,7 +319,20 @@ impl ClusterData {
             .collect();
 
         // First, fetch etcd members via gRPC
-        match client.etcd_members().await {
+        let members = match tokio::time::timeout(MEMBERS_TIMEOUT, client.etcd_members()).await {
+            Ok(members) => members,
+            Err(_) => {
+                tracing::warn!(
+                    "{}: no answer within {:?}; reconnecting",
+                    cluster.name,
+                    MEMBERS_TIMEOUT
+                );
+                // Keep what is shown; the next refresh dials anew
+                cluster.client = None;
+                return;
+            }
+        };
+        match members {
             Ok(members) => {
                 cluster.node_ips.clear();
                 for member in &members {
@@ -1739,8 +1758,6 @@ impl ClusterComponent {
     /// Merge finished background refreshes, keeping UI state (expand/collapse)
     /// that the user may have changed while they ran.
     pub fn apply_background_refresh(&mut self) {
-        use futures::FutureExt;
-
         let mut changed = false;
         for idx in 0..self.background_refresh.len() {
             if !self.background_refresh[idx]
@@ -1756,7 +1773,7 @@ impl ClusterComponent {
             // schedule, not on every tick.
             self.cluster_refreshed_at[idx] = Some(std::time::Instant::now());
 
-            let mut fresh = match handle.now_or_never() {
+            let mut fresh = match crate::task::poll_finished(handle) {
                 Some(Ok(fresh)) => fresh,
                 Some(Err(e)) => {
                     // A panicked refresh: don't leave the cluster "connecting…"
@@ -1813,13 +1830,11 @@ impl ClusterComponent {
     ///
     /// Runs in a spawned task so slow talosctl calls never block drawing.
     pub fn poll_network_info(&mut self) {
-        use futures::FutureExt;
-
         if self.network_fetch.as_ref().is_some_and(|f| f.is_finished())
             && let Some(fetch) = self.network_fetch.take()
         {
             let now = std::time::Instant::now();
-            let results = match fetch.now_or_never() {
+            let results = match crate::task::poll_finished(fetch) {
                 Some(Ok(results)) => results,
                 _ => Vec::new(),
             };
@@ -1987,8 +2002,6 @@ impl ClusterComponent {
 
     /// Merge a finished selected-node stats fetch into its cluster's data
     pub fn poll_selected_node_refresh(&mut self) {
-        use futures::FutureExt;
-
         if !self
             .node_stats_fetch
             .as_ref()
@@ -1996,7 +2009,8 @@ impl ClusterComponent {
         {
             return;
         }
-        let Some(Some(Ok(fetch))) = self.node_stats_fetch.take().map(|f| f.now_or_never()) else {
+        let Some(Some(Ok(fetch))) = self.node_stats_fetch.take().map(crate::task::poll_finished)
+        else {
             return;
         };
         let Some(cluster) = self.clusters.iter_mut().find(|c| c.name == fetch.context) else {
