@@ -28,6 +28,9 @@ const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
 
 /// Upper bound for each per-node API call in a refresh
 const NODE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// CPU % is the CPU time used between two samples, so the first load takes
+/// a second one this long after the first before showing anything
+const FIRST_SAMPLE_GAP: Duration = Duration::from_secs(1);
 
 /// Sort order for process list
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -407,12 +410,20 @@ impl ProcessesComponent {
         // fails this time keeps showing its last known processes.
         let mut data = self.state.take_data().unwrap_or_default();
         data.nodes.resize_with(self.nodes.len(), NodeStats::default);
+        let first_sample = data.nodes.iter().all(|n| n.last_cpu_sample.is_none());
 
+        let started = Instant::now();
         let fetches = self
             .nodes
             .iter()
             .map(|n| fetch_node(client.with_node(&n.address)));
         let results = futures::future::join_all(fetches).await;
+        tracing::debug!(
+            "processes: fetched {} node(s) in {:?}, {} failed",
+            results.len(),
+            started.elapsed(),
+            results.iter().filter(|r| r.processes.is_err()).count()
+        );
 
         let mut previous: Vec<NodeProcess> = std::mem::take(&mut data.processes);
         let mut cpu_percentages = HashMap::new();
@@ -509,6 +520,16 @@ impl ProcessesComponent {
         self.state.set_data(data);
         if all_failed {
             self.state.set_error(errors.join("; "));
+            return Ok(());
+        }
+        // Without a previous sample every process reads 0% and the CPU
+        // order is arbitrary: sample again before the first screen
+        let sampled = self
+            .data()
+            .is_some_and(|d| d.nodes.iter().any(|n| n.last_cpu_sample.is_some()));
+        if first_sample && sampled {
+            tokio::time::sleep(FIRST_SAMPLE_GAP).await;
+            return Box::pin(self.refresh()).await;
         }
         Ok(())
     }
