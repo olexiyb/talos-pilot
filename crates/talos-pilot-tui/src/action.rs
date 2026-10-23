@@ -58,6 +58,14 @@ pub enum Action {
     ShowVolumes(String, Option<Vec<String>>),
     /// Show storage/disks view for a node: (hostname, address)
     ShowStorage(String, String),
+    /// Diagnostics, storage or network of every node under a header:
+    /// (kind, title, nodes, a control plane address for workers' kubeconfig)
+    ShowGroup(
+        crate::components::GroupKind,
+        String,
+        Vec<crate::components::GroupNode>,
+        Option<String>,
+    ),
     /// Show node operations overlay: (hostname, address, is_controlplane)
     ShowNodeOperations(String, String, bool),
     /// Show rolling operations overlay with node list: Vec<(hostname, address, is_controlplane)>

@@ -193,6 +193,27 @@ impl DiagnosticsComponent {
         self.talos_context = context;
     }
 
+    /// Checks by category after a refresh, for the group view; the error
+    /// when the run failed
+    pub fn checks_by_category(&self) -> Result<Vec<(&'static str, Vec<DiagnosticCheck>)>, String> {
+        if let Some(error) = self.state.error() {
+            return Err(error.to_string());
+        }
+        let data = self.data().ok_or_else(|| "no data".to_string())?;
+        let checks = [
+            &data.system_checks,
+            &data.kubernetes_checks,
+            &data.cni_checks,
+            &data.service_checks,
+            &data.addon_checks,
+        ];
+        Ok(checks
+            .into_iter()
+            .enumerate()
+            .map(|(idx, checks)| (self.category_title(idx), checks.clone()))
+            .collect())
+    }
+
     /// Set an error message
     pub fn set_error(&mut self, error: String) {
         self.state.set_error(error);

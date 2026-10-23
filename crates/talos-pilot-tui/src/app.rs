@@ -5,10 +5,10 @@ use crate::components::BackgroundRefresh;
 use crate::components::rolling_operations::RollingNodeInfo;
 use crate::components::wizard::{WizardComponent, WizardState};
 use crate::components::{
-    ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent,
-    MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent,
-    RollingOperationsComponent, SecurityComponent, StorageComponent, VolumesComponent,
-    WorkloadHealthComponent,
+    ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, GroupComponent,
+    LifecycleComponent, MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent,
+    ProcessesComponent, RollingOperationsComponent, SecurityComponent, StorageComponent,
+    VolumesComponent, WorkloadHealthComponent,
 };
 use crate::tui::{self, Tui};
 use color_eyre::Result;
@@ -29,6 +29,7 @@ enum RefreshJob {
     Processes(JoinHandle<ProcessesComponent>),
     Etcd(JoinHandle<EtcdComponent>),
     Volumes(JoinHandle<VolumesComponent>),
+    Group(JoinHandle<GroupComponent>),
 }
 
 impl RefreshJob {
@@ -42,6 +43,7 @@ impl RefreshJob {
             RefreshJob::Processes(h) => h.is_finished(),
             RefreshJob::Etcd(h) => h.is_finished(),
             RefreshJob::Volumes(h) => h.is_finished(),
+            RefreshJob::Group(h) => h.is_finished(),
         }
     }
 
@@ -55,6 +57,7 @@ impl RefreshJob {
             RefreshJob::Processes(h) => h.abort(),
             RefreshJob::Etcd(h) => h.abort(),
             RefreshJob::Volumes(h) => h.abort(),
+            RefreshJob::Group(h) => h.abort(),
         }
     }
 }
@@ -97,6 +100,7 @@ enum View {
     Storage,
     NodeOperations,
     RollingOperations,
+    Group,
 }
 
 /// Main application state
@@ -107,6 +111,8 @@ pub struct App {
     view: View,
     /// View the logs screen was opened from, to go back to
     logs_return: View,
+    /// A single-node view opened from a group view goes back to it
+    return_to_group: bool,
     /// Cluster component
     cluster: ClusterComponent,
     /// Multi-service logs component (created when viewing logs)
@@ -137,6 +143,8 @@ pub struct App {
     node_operations: Option<NodeOperationsComponent>,
     /// Rolling operations component (overlay for multi-node operations)
     rolling_operations: Option<RollingOperationsComponent>,
+    /// Diagnostics / storage / network of a node group
+    group: Option<GroupComponent>,
     /// Number of log lines to fetch per service
     tail_lines: i32,
     /// Tick rate for animations (ms)
@@ -186,6 +194,7 @@ impl App {
             should_quit: false,
             view: View::Cluster,
             logs_return: View::Cluster,
+            return_to_group: false,
             cluster: ClusterComponent::new(config_path.clone(), context),
             multi_logs: None,
             log_level_filter: crate::components::multi_logs::ALL_LEVELS,
@@ -201,6 +210,7 @@ impl App {
             storage: None,
             node_operations: None,
             rolling_operations: None,
+            group: None,
             tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
@@ -653,6 +663,11 @@ impl App {
                             let _ = rolling_ops.draw(frame, area);
                         }
                     }
+                    View::Group => {
+                        if let Some(group) = &mut self.group {
+                            let _ = group.draw(frame, area);
+                        }
+                    }
                 }
             })?;
 
@@ -758,6 +773,7 @@ impl App {
             RefreshJob::Processes(h) => finish!(self.processes, h),
             RefreshJob::Etcd(h) => finish!(self.etcd, h),
             RefreshJob::Volumes(h) => finish!(self.volumes, h),
+            RefreshJob::Group(h) => finish!(self.group, h),
         }
     }
 
@@ -874,6 +890,13 @@ impl App {
                     None
                 }
             }
+            View::Group => {
+                if let Some(group) = &mut self.group {
+                    group.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
         })
     }
 
@@ -942,12 +965,22 @@ impl App {
                     View::RollingOperations => {
                         self.rolling_operations = None;
                     }
+                    View::Group => {
+                        self.group = None;
+                    }
                     View::Cluster => {}
                 }
-                // Logs go back to the view they were opened from (its
-                // component is still there), everything else to the cluster
+                // Logs go back to the view they were opened from, a node
+                // opened from a group view to the group (their components
+                // are still there), everything else to the cluster
+                let from_group =
+                    matches!(self.view, View::Diagnostics | View::Storage | View::Network)
+                        && std::mem::take(&mut self.return_to_group)
+                        && self.group.is_some();
                 self.view = if self.view == View::MultiLogs {
                     std::mem::replace(&mut self.logs_return, View::Cluster)
+                } else if from_group {
+                    View::Group
                 } else {
                     View::Cluster
                 };
@@ -1051,6 +1084,13 @@ impl App {
                     View::RollingOperations => {
                         if let Some(rolling_ops) = &mut self.rolling_operations
                             && let Some(next_action) = rolling_ops.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Group => {
+                        if let Some(group) = &mut self.group
+                            && let Some(next_action) = group.update(Action::Tick)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
@@ -1162,6 +1202,18 @@ impl App {
                     View::RollingOperations => {
                         // Rolling operations doesn't have a refresh method
                     }
+                    View::Group => {
+                        if self.refresh_job.is_none()
+                            && let Some(group) = &mut self.group
+                        {
+                            // The cluster's current connection (it may have
+                            // redialled since the view opened)
+                            if let Some(client) = self.cluster.client() {
+                                group.set_client(client.clone());
+                            }
+                            self.refresh_job = Some(RefreshJob::Group(spawn_refresh!(group)));
+                        }
+                    }
                 }
                 let elapsed = started.elapsed();
                 if elapsed >= Duration::from_millis(500) {
@@ -1196,6 +1248,7 @@ impl App {
                 // Legacy - no longer used, we use ShowMultiLogs now
             }
             Action::ShowDiagnostics(hostname, address, role, cp_endpoint) => {
+                self.return_to_group = self.view == View::Group;
                 self.cancel_refresh_job();
                 // Switch to diagnostics view for a node
                 tracing::info!(
@@ -1289,6 +1342,7 @@ impl App {
                 self.view = View::Processes;
             }
             Action::ShowNetwork(hostname, address) => {
+                self.return_to_group = self.view == View::Group;
                 // Switch to network stats view for a node
                 tracing::info!(
                     "ShowNetwork: hostname='{}', address='{}'",
@@ -1417,7 +1471,32 @@ impl App {
                 self.volumes = Some(volumes);
                 self.view = View::Volumes;
             }
+            Action::ShowGroup(kind, title, nodes, cp_endpoint) => {
+                self.cancel_refresh_job();
+                tracing::info!(
+                    "ShowGroup: {:?} of '{}' ({} node(s))",
+                    kind,
+                    title,
+                    nodes.len()
+                );
+                let mut group = GroupComponent::new(
+                    kind,
+                    title,
+                    nodes,
+                    self.cluster.current_context_name().map(str::to_string),
+                    self.cluster.config_path().map(str::to_string),
+                    cp_endpoint,
+                );
+                // Without a client the refresh says so (and retries)
+                if let Some(client) = self.cluster.client() {
+                    group.set_client(client.clone());
+                }
+                self.refresh_job = Some(RefreshJob::Group(spawn_refresh!(group)));
+                self.group = Some(group);
+                self.view = View::Group;
+            }
             Action::ShowStorage(hostname, address) => {
+                self.return_to_group = self.view == View::Group;
                 self.cancel_refresh_job();
                 // Switch to storage view for a node
                 tracing::info!(
@@ -1606,6 +1685,13 @@ impl App {
                     View::RollingOperations => {
                         if let Some(rolling_ops) = &mut self.rolling_operations
                             && let Some(next_action) = rolling_ops.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Group => {
+                        if let Some(group) = &mut self.group
+                            && let Some(next_action) = group.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }

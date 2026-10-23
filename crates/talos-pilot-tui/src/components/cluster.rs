@@ -2,7 +2,7 @@
 
 use crate::action::Action;
 use crate::components::diagnostics::k8s;
-use crate::components::{Component, KERNEL_SERVICE, LogNode, ProcessNode};
+use crate::components::{Component, GroupKind, GroupNode, KERNEL_SERVICE, LogNode, ProcessNode};
 use crate::linstor::{LinstorNode, LinstorStatus, StoragePool, fetch_linstor};
 use crate::reachability::prefer_reachable_addresses;
 use crate::zfs::{ZfsPool, fetch_zfs_pools};
@@ -1318,6 +1318,92 @@ impl ClusterComponent {
         (!nodes.is_empty()).then_some(Action::ShowProcesses(title, nodes))
     }
 
+    /// Online nodes of the selected header as group view nodes, with the
+    /// header's title; `None` on a single node or an empty group
+    fn group_selection(&self) -> Option<(String, Vec<GroupNode>, Option<String>)> {
+        let title = |cluster: &ClusterData| match &self.selected_item {
+            NodeListItem::ClusterHeader(_) => Some(cluster.name.clone()),
+            NodeListItem::ControlPlaneHeader(_) => Some(format!("{} control plane", cluster.name)),
+            NodeListItem::WorkersHeader(_) => Some(format!("{} workers", cluster.name)),
+            _ => None,
+        };
+        let (cluster_idx, names) = self.selected_nodes()?;
+        let cluster = self.clusters.get(cluster_idx)?;
+        let title = title(cluster)?;
+        let address = |name: &String| {
+            cluster
+                .node_ips
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.clone())
+        };
+        let nodes: Vec<GroupNode> = names
+            .iter()
+            .filter(|name| !cluster.offline.contains_key(*name))
+            .map(|name| GroupNode {
+                address: address(name),
+                role: if cluster.is_controlplane(name) {
+                    "controlplane"
+                } else {
+                    "worker"
+                }
+                .to_string(),
+                hostname: name.clone(),
+            })
+            .collect();
+        // Workers fetch their kubeconfig from a control plane
+        let cp_endpoint = self
+            .controlplane_nodes_for(cluster_idx)
+            .first()
+            .map(|(_, v)| address(&v.node));
+        (!nodes.is_empty()).then_some((title, nodes, cp_endpoint))
+    }
+
+    /// The selected node and its address
+    fn selected_node_address(&self) -> Option<(String, String)> {
+        let node_name = self.current_node_name()?;
+        let node_ip = self
+            .node_ips()
+            .get(&node_name)
+            .cloned()
+            .unwrap_or(node_name.clone());
+        Some((node_name, node_ip))
+    }
+
+    /// Network view of the selected node, or of every node under a header
+    fn network_action(&self) -> Option<Action> {
+        if let Some((name, ip)) = self.selected_node_address() {
+            return Some(Action::ShowNetwork(name, ip));
+        }
+        let (title, nodes, cp) = self.group_selection()?;
+        Some(Action::ShowGroup(GroupKind::Network, title, nodes, cp))
+    }
+
+    /// Storage view of the selected node, or of every node under a header
+    fn storage_action(&self) -> Option<Action> {
+        if let Some((name, ip)) = self.selected_node_address() {
+            return Some(Action::ShowStorage(name, ip));
+        }
+        let (title, nodes, cp) = self.group_selection()?;
+        Some(Action::ShowGroup(GroupKind::Storage, title, nodes, cp))
+    }
+
+    /// Diagnostics of the selected node, or of every node under a header
+    fn diagnostics_action(&self) -> Option<Action> {
+        if let Some((name, ip)) = self.selected_node_address() {
+            let role = self.current_node_role();
+            // For worker nodes, provide a control plane endpoint to fetch kubeconfig from
+            let cp_endpoint = if role == "worker" {
+                self.get_controlplane_endpoint()
+            } else {
+                None
+            };
+            return Some(Action::ShowDiagnostics(name, ip, role, cp_endpoint));
+        }
+        let (title, nodes, cp) = self.group_selection()?;
+        Some(Action::ShowGroup(GroupKind::Diagnostics, title, nodes, cp))
+    }
+
     /// Workloads view for the selection: the whole cluster for a cluster
     /// header, otherwise only the pods on the selected node(s). Offline nodes
     /// stay in scope, since their pods are the ones most likely in trouble.
@@ -2302,55 +2388,10 @@ impl ClusterComponent {
         match menu_item {
             NavMenuItem::Logs => Ok(self.logs_action(None)),
             NavMenuItem::Etcd => Ok(Some(Action::ShowEtcd)),
-            NavMenuItem::Network => {
-                if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self
-                        .node_ips()
-                        .get(&node_name)
-                        .cloned()
-                        .unwrap_or(node_name.clone());
-                    Ok(Some(Action::ShowNetwork(node_name, node_ip)))
-                } else {
-                    Ok(None)
-                }
-            }
-            NavMenuItem::Storage => {
-                if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self
-                        .node_ips()
-                        .get(&node_name)
-                        .cloned()
-                        .unwrap_or(node_name.clone());
-                    Ok(Some(Action::ShowStorage(node_name, node_ip)))
-                } else {
-                    Ok(None)
-                }
-            }
+            NavMenuItem::Network => Ok(self.network_action()),
+            NavMenuItem::Storage => Ok(self.storage_action()),
             NavMenuItem::Processes => Ok(self.processes_action()),
-            NavMenuItem::Diagnostics => {
-                if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self
-                        .node_ips()
-                        .get(&node_name)
-                        .cloned()
-                        .unwrap_or(node_name.clone());
-                    let node_role = self.current_node_role();
-                    // For worker nodes, provide a control plane endpoint to fetch kubeconfig from
-                    let cp_endpoint = if node_role == "worker" {
-                        self.get_controlplane_endpoint()
-                    } else {
-                        None
-                    };
-                    Ok(Some(Action::ShowDiagnostics(
-                        node_name,
-                        node_ip,
-                        node_role,
-                        cp_endpoint,
-                    )))
-                } else {
-                    Ok(None)
-                }
-            }
+            NavMenuItem::Diagnostics => Ok(self.diagnostics_action()),
             NavMenuItem::Certs => Ok(Some(Action::ShowSecurity)),
             NavMenuItem::Lifecycle => Ok(Some(Action::ShowLifecycle)),
             NavMenuItem::Workloads => Ok(Some(self.workloads_action())),
@@ -2561,54 +2602,9 @@ impl Component for ClusterComponent {
             // Direct hotkeys for screens (always work)
             KeyCode::Char('e') => Ok(Some(Action::ShowEtcd)),
             KeyCode::Char('p') => Ok(self.processes_action()),
-            KeyCode::Char('n') => {
-                if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self
-                        .node_ips()
-                        .get(&node_name)
-                        .cloned()
-                        .unwrap_or(node_name.clone());
-                    Ok(Some(Action::ShowNetwork(node_name, node_ip)))
-                } else {
-                    Ok(None)
-                }
-            }
-            KeyCode::Char('s') => {
-                if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self
-                        .node_ips()
-                        .get(&node_name)
-                        .cloned()
-                        .unwrap_or(node_name.clone());
-                    Ok(Some(Action::ShowStorage(node_name, node_ip)))
-                } else {
-                    Ok(None)
-                }
-            }
-            KeyCode::Char('d') => {
-                if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self
-                        .node_ips()
-                        .get(&node_name)
-                        .cloned()
-                        .unwrap_or(node_name.clone());
-                    let node_role = self.current_node_role();
-                    // For worker nodes, provide a control plane endpoint to fetch kubeconfig from
-                    let cp_endpoint = if node_role == "worker" {
-                        self.get_controlplane_endpoint()
-                    } else {
-                        None
-                    };
-                    Ok(Some(Action::ShowDiagnostics(
-                        node_name,
-                        node_ip,
-                        node_role,
-                        cp_endpoint,
-                    )))
-                } else {
-                    Ok(None)
-                }
-            }
+            KeyCode::Char('n') => Ok(self.network_action()),
+            KeyCode::Char('s') => Ok(self.storage_action()),
+            KeyCode::Char('d') => Ok(self.diagnostics_action()),
             KeyCode::Char('c') => Ok(Some(Action::ShowSecurity)),
             KeyCode::Char('y') => Ok(Some(Action::ShowLifecycle)),
             KeyCode::Char('w') => Ok(Some(self.workloads_action())),

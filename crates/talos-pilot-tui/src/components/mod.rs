@@ -5,6 +5,7 @@
 pub mod cluster;
 pub mod diagnostics;
 pub mod etcd;
+pub mod group;
 pub mod home;
 pub mod insecure;
 pub mod lifecycle;
@@ -23,6 +24,7 @@ pub mod workloads;
 pub use cluster::ClusterComponent;
 pub use diagnostics::DiagnosticsComponent;
 pub use etcd::EtcdComponent;
+pub use group::{GroupComponent, GroupKind, GroupNode};
 pub use home::HomeComponent;
 pub use insecure::InsecureComponent;
 pub use lifecycle::LifecycleComponent;
