@@ -108,6 +108,9 @@ const AUTO_REFRESH_INTERVAL_SECS: u64 = 2;
 /// KubeSpan peers are fetched via talosctl, so refresh them less often
 const KUBESPAN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Result of one KubeSpan fetch: whether it is enabled, and its peers
+type KubeSpanFetch = (Option<bool>, Result<Vec<KubeSpanPeerStatus>, String>);
+
 /// Sort order for device list
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortBy {
@@ -283,6 +286,8 @@ pub struct NetworkData {
     pub kubespan_peers: Vec<KubeSpanPeerStatus>,
     /// KubeSpan enabled status
     pub kubespan_enabled: Option<bool>,
+    /// Why the last peer read failed; the peers keep their previous values
+    pub kubespan_error: Option<String>,
 }
 
 /// Network stats component for viewing node network interfaces
@@ -296,7 +301,7 @@ pub struct NetworkStatsComponent {
     /// Custom talosconfig path (from --config)
     config_path: Option<String>,
     /// In-flight KubeSpan fetch: (enabled, peers)
-    kubespan_task: Option<tokio::task::JoinHandle<(Option<bool>, Vec<KubeSpanPeerStatus>)>>,
+    kubespan_task: Option<tokio::task::JoinHandle<KubeSpanFetch>>,
     /// When the last KubeSpan fetch started
     kubespan_started: Option<std::time::Instant>,
 
@@ -592,7 +597,15 @@ impl NetworkStatsComponent {
         {
             if let Some(data) = self.data_mut() {
                 data.kubespan_enabled = enabled;
-                data.kubespan_peers = peers;
+                match peers {
+                    Ok(peers) => {
+                        data.kubespan_peers = peers;
+                        data.kubespan_error = None;
+                    }
+                    // A failed read (e.g. talosctl timing out) says nothing
+                    // about the peers, so keep the last ones we saw
+                    Err(e) => data.kubespan_error = Some(e),
+                }
             }
 
             // Reset selection if needed
@@ -619,12 +632,12 @@ impl NetworkStatsComponent {
             let context = context.as_deref();
             let config_path = config_path.as_deref();
             if !is_kubespan_enabled_for_node(context, &node, config_path).await {
-                return (Some(false), Vec::new());
+                return (Some(false), Ok(Vec::new()));
             }
-            match get_kubespan_peers_for_node(context, &node, config_path).await {
-                Ok(peers) => (Some(true), peers),
-                Err(_) => (Some(true), Vec::new()), // Enabled but no peers or error
-            }
+            let peers = get_kubespan_peers_for_node(context, &node, config_path)
+                .await
+                .map_err(|e| e.to_string());
+            (Some(true), peers)
         }));
     }
 
@@ -2259,19 +2272,37 @@ impl NetworkStatsComponent {
             );
         frame.render_widget(header, content_chunks[0]);
 
-        let info_lines = vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  KubeSpan Status: ", Style::default().fg(Color::Yellow)),
-                Span::styled("Enabled", Style::default().fg(Color::Green)),
-                Span::raw(" │ "),
-                Span::styled("No peers connected", Style::default().fg(Color::Gray)),
-            ]),
-            Line::from(""),
-            Line::from(vec![Span::raw(
-                "  Waiting for other nodes to establish KubeSpan connections.",
-            )]),
-        ];
+        let error = self.data().and_then(|d| d.kubespan_error.clone());
+        let info_lines = match error {
+            Some(error) => vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  KubeSpan Status: ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Enabled", Style::default().fg(Color::Green)),
+                    Span::raw(" │ "),
+                    Span::styled("Could not read peers", Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(vec![Span::raw(format!("  {error}"))]),
+                Line::from(vec![Span::styled(
+                    format!("  Retrying every {}s", KUBESPAN_REFRESH_INTERVAL.as_secs()),
+                    Style::default().fg(Color::DarkGray),
+                )]),
+            ],
+            None => vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  KubeSpan Status: ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Enabled", Style::default().fg(Color::Green)),
+                    Span::raw(" │ "),
+                    Span::styled("No peers connected", Style::default().fg(Color::Gray)),
+                ]),
+                Line::from(""),
+                Line::from(vec![Span::raw(
+                    "  Waiting for other nodes to establish KubeSpan connections.",
+                )]),
+            ],
+        };
 
         let info = Paragraph::new(info_lines).block(Block::default().borders(Borders::NONE));
         frame.render_widget(info, content_chunks[1]);
