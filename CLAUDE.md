@@ -16,7 +16,7 @@ crates/
 ### Key Technologies
 - **Rust 2024 edition**
 - **Async runtime:** tokio
-- **TUI framework:** ratatui + crossterm + tachyonfx
+- **TUI framework:** ratatui + crossterm
 - **gRPC client:** tonic + prost
 - **Kubernetes client:** kube-rs
 - **Error handling:** color-eyre + thiserror

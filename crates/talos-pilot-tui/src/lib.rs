@@ -1,7 +1,7 @@
 //! talos-pilot-tui: Terminal UI for talos-pilot
 //!
 //! This crate provides a Ratatui-based TUI using the Component pattern
-//! with tachyonfx effects for smooth animations.
+//! with crossterm for terminal input and output.
 
 pub mod action;
 pub mod app;

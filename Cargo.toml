@@ -34,9 +34,8 @@ rustls-pemfile = "2"
 rustls-pki-types = "1"
 
 # TUI
-ratatui = "0.29"
-crossterm = "0.28"
-tachyonfx = "0.9"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

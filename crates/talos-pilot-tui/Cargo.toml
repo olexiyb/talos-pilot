@@ -13,7 +13,6 @@ talos-rs.workspace = true
 # TUI
 ratatui.workspace = true
 crossterm.workspace = true
-tachyonfx.workspace = true
 
 # TLS (for crypto provider)
 rustls.workspace = true
