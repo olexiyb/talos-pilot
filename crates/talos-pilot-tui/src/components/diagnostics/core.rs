@@ -361,8 +361,8 @@ pub async fn run_certificate_checks(
     match client.kubeconfig().await {
         Ok(kubeconfig_yaml) => {
             // Parse kubeconfig YAML to extract client certificate
-            if let Ok(kc) = serde_yaml::from_str::<serde_yaml::Value>(&kubeconfig_yaml)
-                && let Some(users) = kc.get("users").and_then(|u| u.as_sequence())
+            if let Ok(kc) = serde_saphyr::from_str::<serde_json::Value>(&kubeconfig_yaml)
+                && let Some(users) = kc.get("users").and_then(|u| u.as_array())
             {
                 for user in users {
                     if let Some(user_data) = user.get("user") {

@@ -633,7 +633,8 @@ impl WorkloadHealthComponent {
                 .metadata
                 .creation_timestamp
                 .as_ref()
-                .map(|ts| Self::format_age(&ts.0))
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts.0.as_second(), 0))
+                .map(|ts| Self::format_age(&ts))
                 .unwrap_or_else(|| "?".to_string());
 
             // Track global counts

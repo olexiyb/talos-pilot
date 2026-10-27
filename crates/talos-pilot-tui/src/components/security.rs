@@ -244,10 +244,10 @@ impl SecurityComponent {
     /// Load kubeconfig certificates via client (static method)
     async fn load_kubeconfig_certs(data: &mut SecurityData, client: &TalosClient) {
         if let Ok(kubeconfig_yaml) = client.kubeconfig().await
-            && let Ok(kc) = serde_yaml::from_str::<serde_yaml::Value>(&kubeconfig_yaml)
+            && let Ok(kc) = serde_saphyr::from_str::<serde_json::Value>(&kubeconfig_yaml)
         {
             // Parse kubeconfig CA
-            if let Some(clusters) = kc.get("clusters").and_then(|c| c.as_sequence()) {
+            if let Some(clusters) = kc.get("clusters").and_then(|c| c.as_array()) {
                 for cluster in clusters {
                     if let Some(cluster_data) = cluster.get("cluster")
                         && let Some(ca_data) = cluster_data
@@ -262,7 +262,7 @@ impl SecurityComponent {
             }
 
             // Parse kubeconfig client cert
-            if let Some(users) = kc.get("users").and_then(|u| u.as_sequence()) {
+            if let Some(users) = kc.get("users").and_then(|u| u.as_array()) {
                 for user in users {
                     if let Some(user_data) = user.get("user")
                         && let Some(cert_data) = user_data

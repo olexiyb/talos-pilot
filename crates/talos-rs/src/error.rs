@@ -11,7 +11,7 @@ pub enum TalosError {
 
     /// Failed to parse configuration
     #[error("Failed to parse config: {0}")]
-    ConfigParse(#[from] serde_yaml::Error),
+    ConfigParse(#[from] serde_saphyr::Error),
 
     /// Invalid configuration
     #[error("Invalid config: {0}")]

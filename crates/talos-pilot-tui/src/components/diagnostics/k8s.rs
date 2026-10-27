@@ -180,7 +180,7 @@ async fn fetch_node_kubeconfig(client: &TalosClient) -> Result<kube::config::Kub
         .kubeconfig()
         .await
         .map_err(|e| K8sError::KubeconfigFetch(e.to_string()))?;
-    serde_yaml::from_str(&kubeconfig_yaml).map_err(|e| K8sError::KubeconfigParse(e.to_string()))
+    serde_saphyr::from_str(&kubeconfig_yaml).map_err(|e| K8sError::KubeconfigParse(e.to_string()))
 }
 
 /// Build a K8s client from an already-parsed kubeconfig.
@@ -788,10 +788,10 @@ pub async fn check_pdb_health(client: &Client) -> Result<PdbHealthInfo, K8sError
         let namespace = pdb.metadata.namespace.clone().unwrap_or_default();
         let status = pdb.status.as_ref();
 
-        let current_healthy = status.map(|s| s.current_healthy).unwrap_or(0);
-        let desired_healthy = status.map(|s| s.desired_healthy).unwrap_or(0);
-        let disruptions_allowed = status.map(|s| s.disruptions_allowed).unwrap_or(0);
-        let expected_pods = status.map(|s| s.expected_pods).unwrap_or(0);
+        let current_healthy = status.and_then(|s| s.current_healthy).unwrap_or(0);
+        let desired_healthy = status.and_then(|s| s.desired_healthy).unwrap_or(0);
+        let disruptions_allowed = status.and_then(|s| s.disruptions_allowed).unwrap_or(0);
+        let expected_pods = status.and_then(|s| s.expected_pods).unwrap_or(0);
 
         // A PDB blocks drain if disruptions_allowed is 0 and there are expected pods
         let would_block_drain = disruptions_allowed == 0 && expected_pods > 0;
@@ -1477,12 +1477,11 @@ mod tests {
     }
 
     fn api_error(code: u16, message: &str) -> kube::Error {
-        kube::Error::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: message.to_string(),
-            reason: String::new(),
-            code,
-        })
+        kube::Error::Api(
+            kube::core::Status::failure(message, "")
+                .with_code(code)
+                .boxed(),
+        )
     }
 
     #[test]
@@ -1681,9 +1680,9 @@ users:
 
         // Same CA but different server endpoints (node IP vs VIP) => same cluster.
         let node: kube::config::Kubeconfig =
-            serde_yaml::from_str(&yaml("CA_ALPHA", "https://10.6.0.2:6443")).unwrap();
+            serde_saphyr::from_str(&yaml("CA_ALPHA", "https://10.6.0.2:6443")).unwrap();
         let vip: kube::config::Kubeconfig =
-            serde_yaml::from_str(&yaml("CA_ALPHA", "https://10.6.0.1:6443")).unwrap();
+            serde_saphyr::from_str(&yaml("CA_ALPHA", "https://10.6.0.1:6443")).unwrap();
         assert_eq!(
             current_context_cluster_ca(&node).as_deref(),
             Some("CA_ALPHA")
@@ -1696,7 +1695,7 @@ users:
 
         // Different CA => different cluster.
         let other: kube::config::Kubeconfig =
-            serde_yaml::from_str(&yaml("CA_BETA", "https://192.0.2.9:6443")).unwrap();
+            serde_saphyr::from_str(&yaml("CA_BETA", "https://192.0.2.9:6443")).unwrap();
         assert_ne!(
             current_context_cluster_ca(&node),
             current_context_cluster_ca(&other)
@@ -1705,7 +1704,7 @@ users:
         // No current context / no inline CA => None (treated as "can't compare",
         // never a false mismatch).
         let empty: kube::config::Kubeconfig =
-            serde_yaml::from_str("apiVersion: v1\nkind: Config\n").unwrap();
+            serde_saphyr::from_str("apiVersion: v1\nkind: Config\n").unwrap();
         assert_eq!(current_context_cluster_ca(&empty), None);
     }
 

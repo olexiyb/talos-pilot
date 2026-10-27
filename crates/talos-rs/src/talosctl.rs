@@ -806,12 +806,12 @@ pub async fn get_etcd_spec_for_node(
 fn parse_etcd_spec_yaml(yaml_str: &str) -> Result<EtcdSpecInfo, TalosError> {
     let spec = yaml_str
         .split("\n---")
-        .filter_map(|doc| serde_yaml::from_str::<serde_yaml::Value>(doc.trim()).ok())
+        .filter_map(|doc| serde_saphyr::from_str::<serde_json::Value>(doc.trim()).ok())
         .find_map(|doc| doc.get("spec").cloned())
         .ok_or_else(|| TalosError::ConfigInvalid("no EtcdSpec in talosctl output".to_string()))?;
     let addresses = |key: &str| -> Vec<String> {
         spec.get(key)
-            .and_then(|v| v.as_sequence())
+            .and_then(|v| v.as_array())
             .map(|seq| {
                 seq.iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
@@ -921,9 +921,9 @@ pub async fn get_node_network_info(
 }
 
 /// Iterate over the `spec` of each document in multi-document talosctl YAML
-fn yaml_specs(yaml_str: &str) -> impl Iterator<Item = serde_yaml::Value> + '_ {
+fn yaml_specs(yaml_str: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
     yaml_str.split("\n---").filter_map(|doc| {
-        serde_yaml::from_str::<serde_yaml::Value>(doc.trim())
+        serde_saphyr::from_str::<serde_json::Value>(doc.trim())
             .ok()?
             .get("spec")
             .cloned()
@@ -935,7 +935,7 @@ fn parse_spec_string_list(yaml_str: &str, field: &str) -> Vec<String> {
     yaml_specs(yaml_str)
         .next()
         .and_then(|spec| {
-            spec.get(field)?.as_sequence().map(|seq| {
+            spec.get(field)?.as_array().map(|seq| {
                 seq.iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
                     .collect()
@@ -968,7 +968,7 @@ const TAILSCALE_LINK: &str = "tailscale0";
 /// and its routes from RouteStatus documents
 fn parse_tailscale_link(link: &str, addresses: &str, routes: &str) -> Option<TailscaleLink> {
     let spec = yaml_specs(link).next()?;
-    let on_link = |spec: &serde_yaml::Value, key: &str| {
+    let on_link = |spec: &serde_json::Value, key: &str| {
         spec.get(key).and_then(|v| v.as_str()) == Some(TAILSCALE_LINK)
     };
     let addresses = yaml_specs(addresses)
@@ -1064,7 +1064,7 @@ fn parse_volume_status_yaml(yaml_str: &str) -> Result<Vec<VolumeStatus>, TalosEr
             continue;
         }
 
-        let doc: serde_yaml::Value = match serde_yaml::from_str(doc_str) {
+        let doc: serde_json::Value = match serde_saphyr::from_str(doc_str) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -1164,7 +1164,7 @@ fn parse_disks_yaml(yaml_str: &str) -> Result<Vec<DiskInfo>, TalosError> {
             continue;
         }
 
-        let doc: serde_yaml::Value = match serde_yaml::from_str(doc_str) {
+        let doc: serde_json::Value = match serde_saphyr::from_str(doc_str) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -1284,7 +1284,7 @@ fn parse_machine_config_yaml(yaml_str: &str) -> Result<MachineConfigInfo, TalosE
             continue;
         }
 
-        let doc: serde_yaml::Value = match serde_yaml::from_str(doc_str) {
+        let doc: serde_json::Value = match serde_saphyr::from_str(doc_str) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -1333,7 +1333,7 @@ fn parse_machine_config_yaml(yaml_str: &str) -> Result<MachineConfigInfo, TalosE
 }
 
 /// Render a YAML scalar (`version` may be a number or a string) as a String.
-fn scalar_to_string(v: &serde_yaml::Value) -> Option<String> {
+fn scalar_to_string(v: &serde_json::Value) -> Option<String> {
     if let Some(s) = v.as_str() {
         Some(s.to_string())
     } else if let Some(n) = v.as_u64() {
@@ -1355,7 +1355,7 @@ fn parse_kubespan_peers_yaml(yaml_str: &str) -> Result<Vec<KubeSpanPeerStatus>, 
             continue;
         }
 
-        let doc: serde_yaml::Value = match serde_yaml::from_str(doc_str) {
+        let doc: serde_json::Value = match serde_saphyr::from_str(doc_str) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -1445,7 +1445,7 @@ fn parse_discovery_members_yaml(yaml_str: &str) -> Result<Vec<DiscoveryMember>, 
             continue;
         }
 
-        let doc: serde_yaml::Value = match serde_yaml::from_str(doc_str) {
+        let doc: serde_json::Value = match serde_saphyr::from_str(doc_str) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -1465,7 +1465,7 @@ fn parse_discovery_members_yaml(yaml_str: &str) -> Result<Vec<DiscoveryMember>, 
 
         let addresses = spec
             .and_then(|s| s.get("addresses"))
-            .and_then(|v| v.as_sequence())
+            .and_then(|v| v.as_array())
             .map(|seq| {
                 seq.iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -1513,7 +1513,7 @@ fn parse_address_status_yaml(yaml_str: &str) -> Result<Vec<AddressStatus>, Talos
             continue;
         }
 
-        let doc: serde_yaml::Value = match serde_yaml::from_str(doc_str) {
+        let doc: serde_json::Value = match serde_saphyr::from_str(doc_str) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -1557,7 +1557,7 @@ fn parse_address_status_yaml(yaml_str: &str) -> Result<Vec<AddressStatus>, Talos
 
         let flags = spec
             .and_then(|s| s.get("flags"))
-            .and_then(|v| v.as_sequence())
+            .and_then(|v| v.as_array())
             .map(|seq| {
                 seq.iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -2022,5 +2022,46 @@ spec:
         let status = "spec:\n    addressReady: true\n    connectivityReady: false\n";
         assert_eq!(parse_connectivity_ready(status), Some(false));
         assert_eq!(parse_connectivity_ready("spec: {}\n"), None);
+    }
+
+    #[test]
+    fn parses_kubespan_peers_from_talosctl_yaml() {
+        let yaml = "node: 192.0.2.1
+metadata:
+    namespace: kubespan
+    type: KubeSpanPeerStatuses.kubespan.talos.dev
+    id: AAAAkeyOne+/=
+    created: 2026-10-16T09:19:28Z
+spec:
+    endpoint: 192.0.2.2:51820
+    label: node2
+    state: up
+    receiveBytes: 1213241208180
+    transmitBytes: 1847078950984
+    lastHandshakeTime: 2026-10-26T20:52:13.708617698Z
+---
+node: 192.0.2.1
+metadata:
+    id: BBBBkeyTwo=
+spec:
+    label: node3
+    state: down
+    receiveBytes: 0
+    transmitBytes: 0
+";
+        let peers = parse_kubespan_peers_yaml(yaml).unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].id, "AAAAkeyOne+/=");
+        assert_eq!(peers[0].label, "node2");
+        assert_eq!(peers[0].endpoint.as_deref(), Some("192.0.2.2:51820"));
+        assert_eq!(peers[0].state, "up");
+        assert_eq!(peers[0].rx_bytes, 1_213_241_208_180);
+        assert_eq!(peers[0].tx_bytes, 1_847_078_950_984);
+        assert_eq!(
+            peers[0].last_handshake.as_deref(),
+            Some("2026-10-26T20:52:13.708617698Z")
+        );
+        assert_eq!(peers[1].state, "down");
+        assert_eq!(peers[1].endpoint, None);
     }
 }

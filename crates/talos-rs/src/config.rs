@@ -47,7 +47,7 @@ impl TalosConfig {
             return Err(TalosError::ConfigNotFound(path.display().to_string()));
         }
         let content = std::fs::read_to_string(path)?;
-        let config: TalosConfig = serde_yaml::from_str(&content)?;
+        let config: TalosConfig = serde_saphyr::from_str(&content)?;
         tracing::debug!(
             "Loaded config with {} contexts: {:?}",
             config.contexts.len(),
@@ -178,7 +178,7 @@ contexts:
     crt: Y2xpZW50LWNlcnQ=
     key: Y2xpZW50LWtleQ==
 "#;
-        let config: TalosConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: TalosConfig = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(config.context, "default");
         assert_eq!(config.contexts.len(), 1);
 
@@ -202,7 +202,7 @@ contexts:
     crt: ZQ==
     key: Zg==
 "#;
-        let config: TalosConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: TalosConfig = serde_saphyr::from_str(yaml).unwrap();
         let names = config.context_names();
         assert!(names.contains(&"dev"));
         assert!(names.contains(&"prod"));

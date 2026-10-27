@@ -39,7 +39,8 @@ k8s-openapi.workspace = true
 http = "1"
 
 # Serialization
-serde_yaml.workspace = true
+serde-saphyr.workspace = true
+serde_json.workspace = true
 base64.workspace = true
 
 # Certificate parsing

@@ -9,6 +9,7 @@ description = "Rust SDK for Talos Linux API"
 [dependencies]
 # gRPC
 tonic.workspace = true
+tonic-prost.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 hyper-util.workspace = true
@@ -19,14 +20,13 @@ tokio-stream.workspace = true
 futures.workspace = true
 
 # TLS
-tokio-rustls.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true
 
 # Serialization
 serde.workspace = true
-serde_yaml.workspace = true
+serde-saphyr.workspace = true
+serde_json.workspace = true
 base64.workspace = true
 
 # Error handling
@@ -46,7 +46,7 @@ tracing.workspace = true
 fastrand = "2"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }

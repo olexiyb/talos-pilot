@@ -1784,9 +1784,7 @@ impl ClusterComponent {
     pub async fn refresh(&mut self) -> Result<()> {
         // Older in-flight snapshots would overwrite the fresh results
         self.abort_background_refresh();
-        for at in &mut self.cluster_refreshed_at {
-            *at = None;
-        }
+        self.cluster_refreshed_at.fill(None);
         self.start_background_refresh();
         Ok(())
     }
